@@ -105,5 +105,5 @@ jobs:
         run: |
           echo "### Podinfo Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Digest: \`${{ env.IMAGE_DIGEST }}\`" >> $GITHUB_STEP_STEP_SUMMARY
+          echo "- Digest: \`${{ env.IMAGE_DIGEST }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Pushed to: ${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_STEP_SUMMARY
