@@ -6,7 +6,7 @@ on:
   pull_request:
 
 permissions:
-  id-token: write     # for OIDC authentication to AWS
+  id-token: write     # necessary for OIDC
   contents: read
   packages: write
 
@@ -62,11 +62,7 @@ jobs:
         run: |
           docker tag $IMAGE_NAME:ci-${{ github.run_id }} $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
           docker push $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
-          DIGEST=$(aws ecr batch-get-image \
-              --repository-name $IMAGE_NAME \
-              --image-ids imageTag=ci-${{ github.run_id }} \
-              --query 'images[0].imageId.imageDigest' \
-              --output text)
+          DIGEST=$(aws ecr batch-get-image --repository-name $IMAGE_NAME --image-ids imageTag=ci-${{ github.run_id }} --query 'images[0].imageId.imageDigest' --output text)
           echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_ENV
           echo "✅ Image digest: $DIGEST"
 
@@ -80,13 +76,14 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          cosign sign --yes --keyless $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
+          # Sign using keyless mode; OIDC flow is handled implicitly
+          COSIGN_EXPERIMENTAL=1 cosign sign --yes $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
 
-      - name: Verify signature (policy gate)
+      - name: Verify signature
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          cosign verify --keyless $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
+          COSIGN_EXPERIMENTAL=1 cosign verify $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
 
       - name: Upload SBOM and metadata
         uses: actions/upload-artifact@v4
