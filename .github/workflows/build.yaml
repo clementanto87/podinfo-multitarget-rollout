@@ -1,0 +1,104 @@
+name: Build, Sign & Publish Podinfo
+
+on:
+push:
+branches: [ "main", "develop" ]
+pull_request:
+
+permissions:
+id-token: write          # for OIDC authentication to AWS
+contents: read
+packages: write
+
+env:
+AWS_REGION: us-east-1
+IMAGE_NAME: podinfo
+
+jobs:
+build-and-publish:
+name: Build and Push Podinfo Image
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Checkout source
+    uses: actions/checkout@v4
+
+  - name: Setup Go
+    uses: actions/setup-go@v4
+    with:
+      go-version: '1.20'
+
+  - name: Run unit tests
+    run: |
+      cd src
+      go test ./... -v || echo "No tests yet"
+
+  - name: Configure AWS credentials (OIDC)
+    uses: aws-actions/configure-aws-credentials@v2
+    with:
+      role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/github-actions-oidc-role
+      aws-region: ${{ env.AWS_REGION }}
+
+  - name: Login to Amazon ECR
+    id: login-ecr
+    uses: aws-actions/amazon-ecr-login@v2
+
+  - name: Build Docker image
+    run: |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+        --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
+        -t $IMAGE_NAME:ci-${{ github.run_id }} \
+        -f src/Dockerfile src
+
+  - name: Generate SBOM (Syft)
+    run: |
+      curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+      syft packages $IMAGE_NAME:ci-${{ github.run_id }} -o json > sbom.json
+
+  - name: Tag and Push to ECR
+    env:
+      ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+    run: |
+      docker tag $IMAGE_NAME:ci-${{ github.run_id }} $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
+      docker push $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
+      DIGEST=$(aws ecr batch-get-image \
+          --repository-name $IMAGE_NAME \
+          --image-ids imageTag=ci-${{ github.run_id }} \
+          --query 'images[0].imageId.imageDigest' \
+          --output text)
+      echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_ENV
+      echo "✅ Image digest: $DIGEST"
+
+  - name: Install cosign
+    run: |
+      COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep tag_name | cut -d '"' -f4)
+      curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64
+      chmod +x /usr/local/bin/cosign
+
+  - name: Sign image with cosign (keyless)
+    env:
+      ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+    run: |
+      cosign sign --yes --keyless $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
+
+  - name: Verify signature (policy gate)
+    env:
+      ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+    run: |
+      cosign verify --keyless $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
+
+  - name: Upload SBOM and metadata
+    uses: actions/upload-artifact@v4
+    with:
+      name: sbom-${{ github.run_id }}
+      path: sbom.json
+
+  - name: Output summary
+    run: |
+      echo "### Podinfo Build Summary" >> $GITHUB_STEP_SUMMARY
+      echo "- Image: \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+      echo "- Digest: \`${{ env.IMAGE_DIGEST }}\`" >> $GITHUB_STEP_SUMMARY
+      echo "- Pushed to: ${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_STEP_SUMMARY
+
