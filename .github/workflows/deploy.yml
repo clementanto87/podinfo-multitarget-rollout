@@ -16,7 +16,7 @@ id-token: write
 contents: read
 
 env:
-AWS_REGION: us-east-1
+AWS_REGION: eu-west-1
 IMAGE_NAME: podinfo
 
 jobs:
@@ -185,4 +185,4 @@ steps:
       if [ -n "${{ env.EC2_DEPLOYMENT_ID }}" ]; then
         echo "- EC2 deployment id: ${{ env.EC2_DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
       fi
-```
+

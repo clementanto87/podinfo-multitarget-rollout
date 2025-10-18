@@ -2,6 +2,8 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_caller_identity" "current" {}
+
 # ----------------------------
 # 1. ECR Repository: podinfo
 # ----------------------------
@@ -37,7 +39,6 @@ resource "aws_s3_bucket_versioning" "terraform_state" {
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
   bucket = aws_s3_bucket.terraform_state.id
-
   rule {
     apply_server_side_encryption_by_default {
       sse_algorithm = "AES256"
@@ -116,19 +117,92 @@ resource "aws_iam_role" "github_actions_oidc_role" {
   }
 }
 
-# Optional: Attach a policy to allow ECR push/pull + S3/DynamoDB access if needed
-# (You can scope this later based on your workflow needs)
-resource "aws_iam_role_policy_attachment" "github_ecr_access" {
-  role       = aws_iam_role.github_actions_oidc_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser"
+# ----------------------------
+# 6. Custom IAM Policy: ECR (Create + Push/Pull podinfo)
+# ----------------------------
+resource "aws_iam_role_policy" "github_ecr" {
+  name = "github-actions-ecr"
+  role = aws_iam_role.github_actions_oidc_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:CreateRepository",
+          "ecr:DeleteRepository",
+          "ecr:DescribeRepositories",
+          "ecr:PutLifecyclePolicy",
+          "ecr:SetRepositoryPolicy"
+        ]
+        Resource = "arn:aws:ecr:${var.aws_region}:${data.aws_caller_identity.current.account_id}:repository/podinfo"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
-resource "aws_iam_role_policy_attachment" "github_s3_dynamo_access" {
-  role       = aws_iam_role.github_actions_oidc_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess" # Consider scoping down!
+# ----------------------------
+# 7. Custom IAM Policy: S3 (Terraform State Bucket)
+# ----------------------------
+resource "aws_iam_role_policy" "github_s3" {
+  name = "github-actions-s3-tfstate"
+  role = aws_iam_role.github_actions_oidc_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.terraform_state.arn,
+          "${aws_s3_bucket.terraform_state.arn}/*"
+        ]
+      }
+    ]
+  })
 }
 
-resource "aws_iam_role_policy_attachment" "github_dynamo_access" {
-  role       = aws_iam_role.github_actions_oidc_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess" # Consider scoping down!
+# ----------------------------
+# 8. Custom IAM Policy: DynamoDB (Terraform Lock Table)
+# ----------------------------
+resource "aws_iam_role_policy" "github_dynamodb" {
+  name = "github-actions-dynamodb-locks"
+  role = aws_iam_role.github_actions_oidc_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = aws_dynamodb_table.terraform_locks.arn
+      }
+    ]
+  })
 }
