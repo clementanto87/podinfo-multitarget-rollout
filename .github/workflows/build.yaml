@@ -63,6 +63,7 @@ jobs:
           docker tag $IMAGE_NAME:ci-${{ github.run_id }} $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
           docker push $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
           DIGEST=$(aws ecr batch-get-image --repository-name $IMAGE_NAME --image-ids imageTag=ci-${{ github.run_id }} --query 'images[0].imageId.imageDigest' --output text)
+          # Set the digest as a workflow environment variable for later steps
           echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_ENV
           echo "✅ Image digest: $DIGEST"
 
@@ -76,14 +77,23 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          # Sign using keyless mode; OIDC flow is handled implicitly
+          # Sign using keyless mode; OIDC flow is handled implicitly via the 'id-token: write' permission
           COSIGN_EXPERIMENTAL=1 cosign sign --yes $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
 
       - name: Verify signature
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          # The identity is the subject of the OIDC token, which includes the
+          # repository, workflow file path, and ref.
+          # This regex matches any execution within this repository, which is highly specific.
+          IDENTITY_REGEX: 'https://github.com/${{ github.repository }}/.github/workflows/.*@refs/.*'
+          OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
         run: |
-          COSIGN_EXPERIMENTAL=1 cosign verify $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
+          # Crucially, we must specify the expected OIDC issuer and the identity that signed the image.
+          COSIGN_EXPERIMENTAL=1 cosign verify \
+            --certificate-identity-regexp "${IDENTITY_REGEX}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
 
       - name: Upload SBOM and metadata
         uses: actions/upload-artifact@v4
@@ -95,5 +105,5 @@ jobs:
         run: |
           echo "### Podinfo Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Digest: \`${{ env.IMAGE_DIGEST }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Digest: \`${{ env.IMAGE_DIGEST }}\`" >> $GITHUB_STEP_STEP_SUMMARY
           echo "- Pushed to: ${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_STEP_SUMMARY
