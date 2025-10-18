@@ -1,188 +1,161 @@
+# .github/workflows/deploy.yml
 name: Deploy Podinfo (Dev / Dual-target)
 
 on:
-workflow_dispatch:
-inputs:
-image_digest:
-description: 'Image digest to deploy (sha256:...)'
-required: true
-deploy_env:
-description: 'Target environment (dev or prod)'
-required: true
-default: 'dev'
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Image digest to deploy (sha256:...)'
+        required: true
+      deploy_env:
+        description: 'Target environment (dev or prod)'
+        required: true
+        default: 'dev'
 
 permissions:
-id-token: write
-contents: read
+  id-token: write
+  contents: read
 
 env:
-AWS_REGION: eu-west-1
-IMAGE_NAME: podinfo
+  AWS_REGION: eu-west-1
+  IMAGE_NAME: podinfo
+  AWS_ACCOUNT_ID: "910246205478"
 
 jobs:
-deploy:
-name: Deploy to ${{ github.event.inputs.deploy_env }}
-runs-on: ubuntu-latest
-timeout-minutes: 60
+  deploy:
+    name: Deploy to ${{ github.event.inputs.deploy_env }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-```
-steps:
-  - name: Checkout repo
-    uses: actions/checkout@v4
+      - name: Setup AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
 
-  - name: Setup AWS credentials (OIDC)
-    uses: aws-actions/configure-aws-credentials@v2
-    with:
-      role-to-assume: arn:aws:iam::910246205478:role/github-actions-oidc-role
-      aws-region: eu-west-1
+      - name: Login to ECR (resolve registry)
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-  - name: Login to ECR (resolve registry)
-    id: login-ecr
-    uses: aws-actions/amazon-ecr-login@v2
+      - name: Verify image signature (cosign keyless)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          echo "Verifying image signature for $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
+          if ! command -v cosign >/dev/null 2>&1; then
+            COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep tag_name | cut -d '"' -f4)
+            curl -sSL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+            chmod +x /usr/local/bin/cosign
+          fi
+          cosign verify --keyless "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
 
-  - name: Verify image signature (cosign keyless)
-    env:
-      ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-      IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
-    run: |
-      set -euo pipefail
-      echo "Verifying image signature for $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
-      # Install cosign if not present
-      if ! command -v cosign >/dev/null 2>&1; then
-        COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep tag_name | cut -d '"' -f4)
-        curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64
-        chmod +x /usr/local/bin/cosign
-      fi
-      cosign verify --keyless $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.6
 
-  - name: Install Terraform
-    uses: hashicorp/setup-terraform@v2
-    with:
-      terraform_version: 1.5.6
+      - name: Deploy Lambda infra (Terraform)
+        working-directory: infra/lambda
+        env:
+          TF_VAR_image_digest: ${{ github.event.inputs.image_digest }}
+          TF_VAR_deploy_env: ${{ github.event.inputs.deploy_env }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/lambda/${{ github.event.inputs.deploy_env }}.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-state-locks"
+          terraform apply -auto-approve \
+            -var="image_digest=${{ github.event.inputs.image_digest }}" \
+            -var="deploy_env=${{ github.event.inputs.deploy_env }}"
 
-  - name: Deploy Lambda infra (Terraform)
-    working-directory: infra/lambda
-    env:
-      TF_VAR_image_digest: ${{ github.event.inputs.image_digest }}
-      TF_VAR_deploy_env: ${{ github.event.inputs.deploy_env }}
-      AWS_REGION: ${{ env.AWS_REGION }}
-    run: |
-      set -euo pipefail
-      terraform init -input=false -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=infra/lambda/${{ github.event.inputs.deploy_env }}.tfstate"
-      terraform apply -auto-approve -var="image_digest=${{ github.event.inputs.image_digest }}" -var="deploy_env=${{ github.event.inputs.deploy_env }}"
+      - name: Capture Lambda CodeDeploy deployment id
+        id: lambda-output
+        working-directory: infra/lambda
+        run: |
+          set -euo pipefail
+          terraform output -json > tf-out.json || true
+          if jq -e '.codedeploy_deployment_id' tf-out.json >/dev/null 2>&1; then
+            echo "LAMBDA_DEPLOYMENT_ID=$(jq -r '.codedeploy_deployment_id.value' tf-out.json)" >> $GITHUB_ENV
+          fi
 
-  - name: Capture Lambda CodeDeploy deployment id (terraform output)
-    id: lambda-output
-    working-directory: infra/lambda
-    run: |
-      set -euo pipefail
-      # This assumes your infra/lambda Terraform outputs a codedeploy deployment id as "codedeploy_deployment_id"
-      terraform output -json > tf-out-lambda.json || true
-      if jq -e '.codedeploy_deployment_id' tf-out-lambda.json >/dev/null 2>&1; then
-        jq -r '.codedeploy_deployment_id.value' tf-out-lambda.json > lambda_deployment_id.txt
-        echo "LAMBDA_DEPLOYMENT_ID=$(cat lambda_deployment_id.txt)" >> $GITHUB_ENV
-        echo "Captured Lambda deployment id: $LAMBDA_DEPLOYMENT_ID"
-      else
-        echo "Warning: no codedeploy_deployment_id found in terraform outputs; ensure Terraform module exports it."
-      fi
+      - name: Wait for Lambda CodeDeploy
+        if: env.LAMBDA_DEPLOYMENT_ID != ''
+        run: |
+          set -euo pipefail
+          echo "Waiting for Lambda deployment $LAMBDA_DEPLOYMENT_ID..."
+          aws deploy wait deployment-successful --deployment-id "$LAMBDA_DEPLOYMENT_ID"
 
-  - name: Wait for Lambda CodeDeploy (if available)
-    if: env.LAMBDA_DEPLOYMENT_ID != ''
-    env:
-      LAMBDA_DEPLOYMENT_ID: ${{ env.LAMBDA_DEPLOYMENT_ID }}
-    run: |
-      set -euo pipefail
-      echo "Waiting for Lambda deployment $LAMBDA_DEPLOYMENT_ID to complete..."
-      aws deploy wait deployment-successful --deployment-id "$LAMBDA_DEPLOYMENT_ID"
-      echo "Lambda deployment complete."
+      - name: Deploy EC2 infra (Terraform)
+        working-directory: infra/ec2
+        env:
+          TF_VAR_image_digest: ${{ github.event.inputs.image_digest }}
+          TF_VAR_deploy_env: ${{ github.event.inputs.deploy_env }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/ec2/${{ github.event.inputs.deploy_env }}.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-state-locks"
+          terraform apply -auto-approve \
+            -var="image_digest=${{ github.event.inputs.image_digest }}" \
+            -var="deploy_env=${{ github.event.inputs.deploy_env }}"
 
-  - name: Deploy EC2 infra (Terraform)
-    working-directory: infra/ec2
-    env:
-      TF_VAR_image_digest: ${{ github.event.inputs.image_digest }}
-      TF_VAR_deploy_env: ${{ github.event.inputs.deploy_env }}
-      AWS_REGION: ${{ env.AWS_REGION }}
-    run: |
-      set -euo pipefail
-      terraform init -input=false -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=infra/ec2/${{ github.event.inputs.deploy_env }}.tfstate"
-      terraform apply -auto-approve -var="image_digest=${{ github.event.inputs.image_digest }}" -var="deploy_env=${{ github.event.inputs.deploy_env }}"
+      - name: Capture EC2 CodeDeploy deployment id
+        id: ec2-output
+        working-directory: infra/ec2
+        run: |
+          set -euo pipefail
+          terraform output -json > tf-out.json || true
+          if jq -e '.codedeploy_deployment_id' tf-out.json >/dev/null 2>&1; then
+            echo "EC2_DEPLOYMENT_ID=$(jq -r '.codedeploy_deployment_id.value' tf-out.json)" >> $GITHUB_ENV
+          fi
 
-  - name: Capture EC2 CodeDeploy deployment id (terraform output)
-    id: ec2-output
-    working-directory: infra/ec2
-    run: |
-      set -euo pipefail
-      terraform output -json > tf-out-ec2.json || true
-      if jq -e '.codedeploy_deployment_id' tf-out-ec2.json >/dev/null 2>&1; then
-        jq -r '.codedeploy_deployment_id.value' tf-out-ec2.json > ec2_deployment_id.txt
-        echo "EC2_DEPLOYMENT_ID=$(cat ec2_deployment_id.txt)" >> $GITHUB_ENV
-        echo "Captured EC2 deployment id: $EC2_DEPLOYMENT_ID"
-      else
-        echo "Warning: no codedeploy_deployment_id found in terraform outputs; ensure Terraform module exports it."
-      fi
+      - name: Wait for EC2 CodeDeploy
+        if: env.EC2_DEPLOYMENT_ID != ''
+        run: |
+          set -euo pipefail
+          echo "Waiting for EC2 deployment $EC2_DEPLOYMENT_ID..."
+          aws deploy wait deployment-successful --deployment-id "$EC2_DEPLOYMENT_ID"
 
-  - name: Wait for EC2 CodeDeploy (if available)
-    if: env.EC2_DEPLOYMENT_ID != ''
-    env:
-      EC2_DEPLOYMENT_ID: ${{ env.EC2_DEPLOYMENT_ID }}
-    run: |
-      set -euo pipefail
-      echo "Waiting for EC2 deployment $EC2_DEPLOYMENT_ID to complete..."
-      aws deploy wait deployment-successful --deployment-id "$EC2_DEPLOYMENT_ID"
-      echo "EC2 deployment complete."
+      - name: Fetch endpoints from Terraform outputs
+        run: |
+          set -euo pipefail
+          LAMBDA_URL=""
+          ALB_DNS=""
+          if [ -f infra/lambda/tf-out.json ]; then
+            LAMBDA_URL=$(jq -r '.lambda_api_url.value // empty' infra/lambda/tf-out.json || true)
+          fi
+          if [ -f infra/ec2/tf-out.json ]; then
+            ALB_DNS=$(jq -r '.alb_dns.value // empty' infra/ec2/tf-out.json || true)
+          fi
+          echo "LAMBDA_URL=${LAMBDA_URL}" >> $GITHUB_ENV
+          echo "ALB_DNS=${ALB_DNS}" >> $GITHUB_ENV
 
-  - name: Fetch endpoints from Terraform outputs (for smoke tests)
-    id: endpoints
-    run: |
-      set -euo pipefail
-      # Try to read lambda_api_url and alb_dns from respective stacks
-      if [ -d infra/lambda ]; then
-        (cd infra/lambda && terraform output -json > /tmp/tf-lambda.json) || true
-        LAMBDA_URL=$(jq -r '.lambda_api_url.value // empty' /tmp/tf-lambda.json || true)
-        echo "LAMBDA_URL=${LAMBDA_URL}" >> $GITHUB_ENV
-      fi
-      if [ -d infra/ec2 ]; then
-        (cd infra/ec2 && terraform output -json > /tmp/tf-ec2.json) || true
-        ALB_DNS=$(jq -r '.alb_dns.value // empty' /tmp/tf-ec2.json || true)
-        echo "ALB_DNS=${ALB_DNS}" >> $GITHUB_ENV
-      fi
-      echo "Captured endpoints: $LAMBDA_URL $ALB_DNS"
+      - name: Run smoke tests
+        env:
+          LAMBDA_URL: ${{ env.LAMBDA_URL }}
+          ALB_DNS: ${{ env.ALB_DNS }}
+        run: |
+          set -euo pipefail
+          if [ -n "$LAMBDA_URL" ]; then
+            curl -sfS "$LAMBDA_URL/healthz"
+          fi
+          if [ -n "$ALB_DNS" ]; then
+            curl -sfS "http://$ALB_DNS/healthz"  # or https if you have TLS
+          fi
 
-  - name: Run smoke tests
-    env:
-      LAMBDA_URL: ${{ env.LAMBDA_URL }}
-      ALB_DNS: ${{ env.ALB_DNS }}
-    run: |
-      set -euo pipefail
-      echo "Running smoke tests..."
-      if [ -n "$LAMBDA_URL" ]; then
-        echo "Testing Lambda endpoint: $LAMBDA_URL"
-        curl -sfS "$LAMBDA_URL/healthz" || (echo "Lambda health check failed" && exit 1)
-        curl -sfS "$LAMBDA_URL/metrics" > /tmp/lambda-metrics || true
-      else
-        echo "No Lambda URL detected; skipping Lambda smoke tests."
-      fi
-
-      if [ -n "$ALB_DNS" ]; then
-        echo "Testing ALB endpoint: https://$ALB_DNS"
-        curl -sfS "https://$ALB_DNS/healthz" || (echo "ALB health check failed" && exit 1)
-        curl -sfS "https://$ALB_DNS/metrics" > /tmp/alb-metrics || true
-      else
-        echo "No ALB DNS detected; skipping ALB smoke tests."
-      fi
-      echo "Smoke tests passed."
-
-  - name: Post-deploy summary
-    run: |
-      echo "### Deploy Summary" >> $GITHUB_STEP_SUMMARY
-      echo "- Environment: ${{ github.event.inputs.deploy_env }}" >> $GITHUB_STEP_SUMMARY
-      echo "- Image digest: ${{ github.event.inputs.image_digest }}" >> $GITHUB_STEP_SUMMARY
-      echo "- Lambda URL: ${{ env.LAMBDA_URL }}" >> $GITHUB_STEP_SUMMARY
-      echo "- ALB DNS: ${{ env.ALB_DNS }}" >> $GITHUB_STEP_SUMMARY
-      if [ -n "${{ env.LAMBDA_DEPLOYMENT_ID }}" ]; then
-        echo "- Lambda deployment id: ${{ env.LAMBDA_DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
-      fi
-      if [ -n "${{ env.EC2_DEPLOYMENT_ID }}" ]; then
-        echo "- EC2 deployment id: ${{ env.EC2_DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
-      fi
-
+      - name: Post-deploy summary
+        run: |
+          echo "### Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: ${{ github.event.inputs.deploy_env }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ env.IMAGE_NAME }}@${{ github.event.inputs.image_digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Lambda: ${{ env.LAMBDA_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ALB: ${{ env.ALB_DNS }}" >> $GITHUB_STEP_SUMMARY
