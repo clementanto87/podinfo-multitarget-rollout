@@ -1,0 +1,128 @@
+# .github/workflows/promote.yml
+name: Promote Podinfo Image to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Immutable image digest to promote (sha256:...)"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  IMAGE_NAME: podinfo
+  DEPLOY_ENV: prod
+  AWS_ACCOUNT_ID: "910246205478"  # ← Use your real account ID
+
+jobs:
+  approval:
+    name: Manual Approval Gate
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/
+    steps:
+      - name: Confirm Promotion
+        run: echo "Awaiting manual approval before promoting to production..."
+
+  promote:
+    name: Deploy to Production (Dual-Target)
+    runs-on: ubuntu-latest
+    needs: approval
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify Cosign signature (keyless)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          echo "Verifying cosign signature for prod promotion..."
+          if ! command -v cosign >/dev/null 2>&1; then
+            COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep tag_name | cut -d '"' -f4)
+            curl -sSL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+            chmod +x /usr/local/bin/cosign
+          fi
+          cosign verify --keyless "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.6
+
+      - name: Apply Lambda (prod)
+        working-directory: infra/lambda
+        env:
+          TF_VAR_image_digest: ${{ github.event.inputs.image_digest }}
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/lambda/${{ env.DEPLOY_ENV }}.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-state-locks"
+          terraform apply -auto-approve \
+            -var="image_digest=${{ github.event.inputs.image_digest }}" \
+            -var="deploy_env=${{ env.DEPLOY_ENV }}"
+
+      - name: Apply EC2 (prod)
+        working-directory: infra/ec2
+        env:
+          TF_VAR_image_digest: ${{ github.event.inputs.image_digest }}
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/ec2/${{ env.DEPLOY_ENV }}.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-state-locks"
+          terraform apply -auto-approve \
+            -var="image_digest=${{ github.event.inputs.image_digest }}" \
+            -var="deploy_env=${{ env.DEPLOY_ENV }}"
+
+      - name: Smoke tests (prod endpoints)
+        run: |
+          set -euo pipefail
+          echo "Running post-promotion smoke tests..."
+          LAMBDA_URL=""
+          ALB_DNS=""
+          if [ -d infra/lambda ]; then
+            LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
+          fi
+          if [ -d infra/ec2 ]; then
+            ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
+          fi
+
+          if [ -n "$LAMBDA_URL" ]; then
+            curl -sfS "$LAMBDA_URL/healthz"
+          fi
+          if [ -n "$ALB_DNS" ]; then
+            curl -sfS "http://$ALB_DNS/healthz"  # or https if TLS is configured
+          fi
+          echo "✅ Smoke tests passed."
+
+      - name: Summary
+        run: |
+          echo "### Production Promotion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Image digest: \`${{ github.event.inputs.image_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: prod" >> $GITHUB_STEP_SUMMARY
+          echo "- Promoted by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
