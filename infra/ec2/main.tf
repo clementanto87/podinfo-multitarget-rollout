@@ -84,7 +84,8 @@ resource "aws_security_group" "alb_sg" {
 resource "aws_security_group" "instance_sg" {
   name        = "${local.name_prefix}-instance-sg"
   vpc_id      = aws_vpc.this.id
-  description = "Allow ALB -> instances"
+  # FIX: Made description concise to avoid 'InvalidParameterValue' error
+  description = "ALB to instance access"
   ingress {
     from_port       = 9898
     to_port         = 9898
@@ -154,6 +155,7 @@ resource "aws_lb_listener" "http" {
 
   default_action {
     type             = "forward"
+    # Set the initial default TG to blue, CodeDeploy will manage the swap.
     target_group_arn = aws_lb_target_group.blue.arn
   }
 }
@@ -214,6 +216,10 @@ resource "aws_launch_template" "lt" {
     region       = var.region
   }))
 
+  # FIX: Add security groups to the Launch Template.
+  # Instances need the SG to communicate with the ALB.
+  vpc_security_group_ids = [aws_security_group.instance_sg.id]
+
   tag_specifications {
     resource_type = "instance"
     tags = {
@@ -242,8 +248,7 @@ resource "aws_autoscaling_group" "asg" {
     version = "$Latest"
   }
 
-  # ⚠️ REMOVED target_group_arns — CodeDeploy manages registration
-  # target_group_arns = [...] ← DO NOT include this
+  # target_group_arns should remain REMOVED for CodeDeploy ASG management
 
   health_check_type         = "ELB"
   health_check_grace_period = 60
@@ -304,15 +309,23 @@ resource "aws_codedeploy_deployment_group" "ec2_group" {
     }
   }
 
-  # ✅ CORRECT: Use target_group_info for ALB
+  # FIX: Add target_group_pair_info for Blue/Green
   load_balancer_info {
-    target_group_info {
-      name = aws_lb_target_group.blue.name
-    }
-    target_group_info {
-      name = aws_lb_target_group.green.name
+    target_group_pair_info {
+      prod_traffic_route {
+        listener_arns = [aws_lb_listener.http.arn]
+      }
+      target_groups {
+        name = aws_lb_target_group.blue.name
+      }
+      target_groups {
+        name = aws_lb_target_group.green.name
+      }
     }
   }
+
+  # NEW: Add ASG configuration for CodeDeploy to manage
+  auto_scaling_groups = [aws_autoscaling_group.asg.name]
 
   auto_rollback_configuration {
     enabled = true
@@ -322,6 +335,8 @@ resource "aws_codedeploy_deployment_group" "ec2_group" {
   alarm_configuration {
     enabled = true
     alarms  = [aws_cloudwatch_metric_alarm.alb_5xx.arn]
+    # NEW: Add explicit dependency to ensure alarm exists before deployment group is created
+    depends_on = [aws_cloudwatch_metric_alarm.alb_5xx]
   }
 }
 
@@ -343,6 +358,3 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   }
   treat_missing_data = "notBreaching"
 }
-
-
-
