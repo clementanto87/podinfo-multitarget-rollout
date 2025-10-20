@@ -133,7 +133,7 @@ resource "aws_codedeploy_deployment_group" "lambda_group" {
 
   alarm_configuration {
     enabled                = true
-    alarms                 = [aws_cloudwatch_metric_alarm.lambda_error.name]
+    alarms                 = [aws_cloudwatch_metric_alarm.lambda_error.alarm_name]
     ignore_poll_alarm_failure = false
   }
 
