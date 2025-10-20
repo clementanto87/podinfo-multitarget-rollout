@@ -1,27 +1,27 @@
 # --- Build stage ---
-FROM public.ecr.aws/library/golang:1.20-alpine AS builder
-WORKDIR /src
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+    FROM public.ecr.aws/docker/library/golang:1.20-alpine AS builder
+    WORKDIR /src
+    ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 
-COPY go.mod go.sum* ./
-RUN go mod download
+    COPY go.mod go.sum* ./
+    RUN go mod download
 
-COPY . .
-ARG BUILD_DATE
-ARG GIT_COMMIT
-RUN go build -ldflags="-s -w -X main.BuildDate=${BUILD_DATE} -X main.Commit=${GIT_COMMIT}" \
-    -o /podinfo ./cmd/podinfo
+    COPY . .
+    ARG BUILD_DATE
+    ARG GIT_COMMIT
+    RUN go build -ldflags="-s -w -X main.BuildDate=${BUILD_DATE} -X main.Commit=${GIT_COMMIT}" \
+        -o /podinfo ./cmd/podinfo
 
-# --- Final minimal image ---
-FROM public.ecr.aws/library/alpine:3.18
-RUN addgroup -S app && adduser -S -G app app
-USER app
-WORKDIR /home/app
+    # --- Final minimal image ---
+    FROM public.ecr.aws/docker/library/alpine:3.18
+    RUN addgroup -S app && adduser -S -G app app
+    USER app
+    WORKDIR /home/app
 
-COPY --from=builder /podinfo /home/app/podinfo
+    COPY --from=builder /podinfo /home/app/podinfo
 
-EXPOSE 9898
-HEALTHCHECK --interval=15s --timeout=3s CMD wget -qO- http://localhost:9898/healthz || exit 1
+    EXPOSE 9898
+    HEALTHCHECK --interval=15s --timeout=3s CMD wget -qO- http://localhost:9898/healthz || exit 1
 
-ENTRYPOINT ["/home/app/podinfo"]
-CMD ["--port=9898"]
+    ENTRYPOINT ["/home/app/podinfo"]
+    CMD ["--port=9898"]
