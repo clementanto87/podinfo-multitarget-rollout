@@ -1,11 +1,12 @@
 name: Build, Sign & Publish Podinfo
+
 on:
   push:
     branches: ["main", "develop"]
   pull_request:
 
 permissions:
-  id-token: write     # required for keyless Cosign signing
+  id-token: write     # necessary for OIDC
   contents: read
   packages: write
 
@@ -17,6 +18,7 @@ jobs:
   build-and-publish:
     name: Build and Push Podinfo Image
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -32,7 +34,7 @@ jobs:
           go test ./... -v || echo "No tests yet"
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: arn:aws:iam::910246205478:role/github-actions-oidc-role
           aws-region: ${{ env.AWS_REGION }}
@@ -41,103 +43,58 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # --------------------------------------------------------------------
-      # Build & Push Docker image
-      # --------------------------------------------------------------------
       - name: Build Docker image
-        id: build-image # Add an ID for outputting the local image tag
         run: |
-          LOCAL_TAG=${{ env.IMAGE_NAME }}:ci-${{ github.run_id }}
           docker build \
             --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
             --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
-            -t $LOCAL_TAG \
+            -t $IMAGE_NAME:ci-${{ github.run_id }} \
             -f src/Dockerfile src
-          echo "LOCAL_TAG=$LOCAL_TAG" >> $GITHUB_OUTPUT # Export the local tag for later use
 
       - name: Generate SBOM (Syft)
         run: |
-          # Install syft
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          # Use the local tag from the build step's output
-          syft packages ${{ steps.build-image.outputs.LOCAL_TAG }} -o json > sbom.json
+          syft packages $IMAGE_NAME:ci-${{ github.run_id }} -o json > sbom.json
 
       - name: Tag and Push to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          LOCAL_TAG: ${{ steps.build-image.outputs.LOCAL_TAG }} # Use the output from the build step
         run: |
-          set -euo pipefail
-          ECR_IMAGE=$ECR_REGISTRY/$IMAGE_NAME:$LOCAL_TAG
-          
-          # Tag the image with the full ECR path
-          docker tag $LOCAL_TAG $ECR_IMAGE
-          
-          # Push to ECR. This is the crucial step that generates the digest.
-          docker push $ECR_IMAGE
-          
-          # Get the full digest (repo@sha256:...) after the push.
-          # The 'docker inspect' needs the full ECR path for 'RepoDigests' to be populated.
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_IMAGE | cut -d'@' -f2)
-          
-          if [ -z "$DIGEST" ]; then
-              echo "Error: Could not retrieve image digest after push."
-              exit 1
-          fi
-          
+          docker tag $IMAGE_NAME:ci-${{ github.run_id }} $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
+          docker push $ECR_REGISTRY/$IMAGE_NAME:ci-${{ github.run_id }}
+          DIGEST=$(aws ecr batch-get-image --repository-name $IMAGE_NAME --image-ids imageTag=ci-${{ github.run_id }} --query 'images[0].imageId.imageDigest' --output text)
+          # Set the digest as a workflow environment variable for later steps
           echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_ENV
           echo "✅ Image digest: $DIGEST"
 
-      # --------------------------------------------------------------------
-      # Sign and Verify (Sigstore Cosign)
-      # --------------------------------------------------------------------
       - name: Install cosign
         run: |
-          set -euo pipefail
-          # Fetch the latest version from the API (requires 'jq')
-          if ! command -v jq &> /dev/null; then
-             sudo apt-get update && sudo apt-get install -y jq
-          fi
-          
-          COSIGN_VERSION=$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest | jq -r .tag_name)
-          if [ -z "$COSIGN_VERSION" ] || [ "$COSIGN_VERSION" = "null" ]; then
-            COSIGN_VERSION="v2.2.4" # fallback stable version
-          fi
-          
-          echo "Installing Cosign $COSIGN_VERSION"
-          curl -fsSL -o /usr/local/bin/cosign \
-            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep tag_name | cut -d '"' -f4)
+          curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64
           chmod +x /usr/local/bin/cosign
-          cosign version
 
-      - name: Sign image with Cosign (keyless)
+      - name: Sign image with cosign (keyless)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          COSIGN_EXPERIMENTAL: "1"
         run: |
-          set -euo pipefail
-          IMAGE_REF=$ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
-          echo "Signing $IMAGE_REF"
-          # It's best practice to sign the image by digest
-          cosign sign --yes $IMAGE_REF
+          # Sign using keyless mode; OIDC flow is handled implicitly via the 'id-token: write' permission
+          COSIGN_EXPERIMENTAL=1 cosign sign --yes $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
 
       - name: Verify signature
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          COSIGN_EXPERIMENTAL: "1"
+          # The identity is the subject of the OIDC token, which includes the
+          # repository, workflow file path, and ref.
+          # This regex matches any execution within this repository, which is highly specific.
+          IDENTITY_REGEX: 'https://github.com/${{ github.repository }}/.github/workflows/.*@refs/.*'
+          OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
         run: |
-          set -euo pipefail
-          # Use a more specific identity match for better security.
-          # This verifies the signature was made by an OIDC token from the same repository.
-          # NOTE: The regex needs to be adapted for your specific repository path (e.g., your-org/podinfo).
-          cosign verify \
-            $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            --certificate-identity "https://github.com/${{ github.repository }}"
+          # Crucially, we must specify the expected OIDC issuer and the identity that signed the image.
+          COSIGN_EXPERIMENTAL=1 cosign verify \
+            --certificate-identity-regexp "${IDENTITY_REGEX}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            $ECR_REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST
 
-      # --------------------------------------------------------------------
-      # Upload SBOM and Summary
-      # --------------------------------------------------------------------
       - name: Upload SBOM and metadata
         uses: actions/upload-artifact@v4
         with:
@@ -149,5 +106,4 @@ jobs:
           echo "### Podinfo Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Digest: \`${{ env.IMAGE_DIGEST }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- ECR: \`${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- SBOM: \`sbom-${{ github.run_id }}.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Pushed to: ${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_STEP_SUMMARY
