@@ -50,16 +50,24 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
+          COSIGN_EXPERIMENTAL: "1"
         run: |
           set -euo pipefail
           echo "Verifying image signature for $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
           if ! command -v cosign >/dev/null 2>&1; then
-            # Use official install script for latest v2+
-            curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /usr/local/bin/cosign
+            COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest \
+              | jq -r .tag_name)
+            echo "Installing Cosign ${COSIGN_VERSION}"
+            curl -sSL -o /usr/local/bin/cosign \
+              "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
             chmod +x /usr/local/bin/cosign
           fi
-          cosign version  # debug: print version
-          cosign verify --keyless "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
+
+          cosign verify \
+            $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST \
+            --certificate-identity-regexp "https://github.com/.+" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+      
 
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
