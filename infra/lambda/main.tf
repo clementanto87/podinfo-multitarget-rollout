@@ -25,7 +25,7 @@ resource "aws_lambda_function" "podinfo" {
   function_name = local.function_name
   package_type  = "Image"
   # Use a stable placeholder image — CodeDeploy will override it
-  image_uri     = "public.ecr.aws/lambda/nodejs:18"  # or your base image
+  image_uri     = "${var.ecr_repo_url}@${var.image_digest}"
   role          = aws_iam_role.lambda_exec.arn
   timeout       = 15
   memory_size   = 256
