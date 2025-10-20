@@ -169,6 +169,7 @@ jobs:
             -var="deploy_env=${{ github.event.inputs.deploy_env }}" \
             -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
             -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}"
+            -var="image_digest=${{ github.event.inputs.image_digest }}"
 
       - name: Create EC2 deployment bundle
         run: |
