@@ -1,0 +1,21 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/podinfo-deploy
+
+hooks:
+  BeforeInstall:
+    - location: scripts/pre_traffic_hook.sh
+      timeout: 300
+      runas: root
+
+  AfterInstall:
+    - location: scripts/smoke_tests.sh
+      timeout: 120
+      runas: root
+
+  ApplicationStart:
+    - location: scripts/post_traffic_hook.sh
+      timeout: 300
+      runas: root

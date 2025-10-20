@@ -1,0 +1,9 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::Lambda::Function
+      Properties:
+        Name: "podinfo-${env:DEPLOY_ENV}"  # Will be interpolated by GitHub Actions
+        Alias: "live"
+        CurrentVersion: "1"
+        TargetVersion: "2"
