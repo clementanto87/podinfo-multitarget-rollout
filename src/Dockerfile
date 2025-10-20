@@ -1,5 +1,5 @@
 # --- Build stage ---
-    FROM public.ecr.aws/docker/library/golang:1.20-alpine AS builder
+    FROM golang:1.20-alpine AS builder
     WORKDIR /src
     ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 
@@ -13,7 +13,7 @@
         -o /podinfo ./cmd/podinfo
 
     # --- Final minimal image ---
-    FROM public.ecr.aws/docker/library/alpine:3.18
+    FROM alpine:3.18
     RUN addgroup -S app && adduser -S -G app app
     USER app
     WORKDIR /home/app
