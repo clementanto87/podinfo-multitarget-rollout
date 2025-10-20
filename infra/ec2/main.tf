@@ -321,7 +321,7 @@ resource "aws_codedeploy_deployment_group" "ec2_group" {
 
   alarm_configuration {
     enabled = true
-    alarms  = [aws_cloudwatch_metric_alarm.alb_5xx.name]
+    alarms  = [aws_cloudwatch_metric_alarm.alb_5xx.arn]
   }
 }
 
@@ -344,37 +344,5 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   treat_missing_data = "notBreaching"
 }
 
-####################
-# Optional ASG Target Tracking (scalability improvement)
-####################
-resource "aws_autoscaling_policy" "req_per_target" {
-  count = var.enable_scaling ? 1 : 0
-  name  = "${local.name_prefix}-req-per-target"
-  resource_id = aws_autoscaling_group.asg.id
-  scalable_dimension = "autoscaling:autoScalingGroup:DesiredCapacity"
-  service_namespace  = "autoscaling"
-  policy_type        = "TargetTrackingScaling"
 
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ALBRequestCountPerTarget"
-      resource_label         = "${aws_lb.alb.arn_suffix}/${aws_lb_target_group.green.arn_suffix}"
-    }
-    target_value = var.target_requests_per_target
-  }
-}
 
-####################
-# Outputs
-####################
-output "alb_dns" {
-  value = aws_lb.alb.dns_name
-}
-
-output "codedeploy_app_name" {
-  value = aws_codedeploy_app.ec2.name
-}
-
-output "codedeploy_deployment_group_name" {
-  value = aws_codedeploy_deployment_group.ec2_group.deployment_group_name
-}
