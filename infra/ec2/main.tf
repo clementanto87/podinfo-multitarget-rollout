@@ -84,7 +84,7 @@ resource "aws_security_group" "alb_sg" {
 resource "aws_security_group" "instance_sg" {
   name        = "${local.name_prefix}-instance-sg"
   vpc_id      = aws_vpc.this.id
-  description = "Allow ALB -> instances"
+  description = "Allow ALB - instances"
   ingress {
     from_port       = 9898
     to_port         = 9898
