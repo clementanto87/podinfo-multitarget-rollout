@@ -45,7 +45,7 @@ resource "aws_lambda_function" "podinfo" {
 # Lambda Execution Role
 ####################
 resource "aws_iam_role" "lambda_exec" {
-  name = "lambda-exec-${var.deploy_env}"
+  name = "podinfo-lambda-exec-${var.deploy_env}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
