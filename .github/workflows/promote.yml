@@ -120,27 +120,27 @@ jobs:
           FUNCTION_NAME="podinfo-${{ env.DEPLOY_ENV }}"
 
           # 1. Fetch the current published version of the 'live' alias.
-          # If the alias doesn't exist (first deployment), default to '1'.
+          # Use "2>/dev/null || echo '1'" to default to '1' if the alias doesn't exist.
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
             --name live \
             --query FunctionVersion \
             --output text 2>/dev/null || echo "1")
           
-          # 2. Calculate the TargetVersion. CodeDeploy manages the new version, 
-          # which is always one higher than the current published version.
-          if [ "$CURRENT_VERSION" = "\$LATEST" ] || [ "$CURRENT_VERSION" = "1" ]; then
-            # If it's the first deploy or points to $LATEST, assume the target is 2.
-            TARGET_VERSION="2"
-          else
-            # Calculate the next integer version
-            TARGET_VERSION=$((CURRENT_VERSION + 1))
+          # 2. Validate CURRENT_VERSION is a positive integer. Fallback to '1' if not.
+          # This specifically fixes the "must be a valid positive integer" error.
+          if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ && "$CURRENT_VERSION" -gt 0 ]]; then
+            echo "Current version derived from alias ('$CURRENT_VERSION') is not a positive integer. Setting to 1 for initial deploy or fallback."
+            CURRENT_VERSION="1"
           fi
+          
+          # 3. Calculate the TargetVersion. It is always CURRENT_VERSION + 1.
+          TARGET_VERSION=$((CURRENT_VERSION + 1))
           
           echo "Current Lambda Live Version: $CURRENT_VERSION"
           echo "Calculated Lambda Target Version: $TARGET_VERSION"
 
-          # 3. Create the AppSpec with the required dynamic versions
+          # 4. Create the AppSpec with the required dynamic versions
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
