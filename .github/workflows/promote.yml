@@ -121,7 +121,7 @@ jobs:
           ALIAS_NAME="live"
 
           # 1. Get the current *numeric* version the 'live' alias points to (CurrentVersion).
-          # This must match what CodeDeploy sees immediately before it runs.
+          # This must match what CodeDeploy sees immediately before it runs to avoid mismatch error.
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
             --name "$ALIAS_NAME" \
@@ -141,7 +141,7 @@ jobs:
           echo "AppSpec CurrentVersion: $CURRENT_VERSION"
           echo "AppSpec TargetVersion: $TARGET_VERSION"
 
-          # 4. Create the AppSpec
+          # 4. Create the AppSpec with dynamic values
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
