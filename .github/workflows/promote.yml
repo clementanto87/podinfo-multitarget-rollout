@@ -113,83 +113,72 @@ jobs:
             -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
             -var="image_digest=${{ github.event.inputs.image_digest }}"
 
-      - name: Generate AppSpec for Lambda CodeDeploy (prod)
-        working-directory: infra/lambda
+      - name: Prepare Lambda for CodeDeploy (Get Versions)
+        id: prepare_lambda
         run: |
           set -euo pipefail
           FUNCTION_NAME="podinfo-${{ env.DEPLOY_ENV }}"
           ALIAS_NAME="live"
 
-          # 1. Check if alias exists and get its current version
-          ALIAS_EXISTS="false"
+          # 1. Get the current version pointed to by the alias.
+          # If the alias doesn't exist, CURRENT_VERSION will be empty.
+          echo "Checking for existing alias '$ALIAS_NAME' on function '$FUNCTION_NAME'..."
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
             --name "$ALIAS_NAME" \
             --query FunctionVersion \
-            --output text 2>/dev/null && ALIAS_EXISTS="true" || echo "")
+            --output text 2>/dev/null || echo "")
 
-          # 2. Publish a new version from $LATEST (which Terraform just updated)
-          NEW_VERSION=$(aws lambda publish-version \
+          if [ -n "$CURRENT_VERSION" ]; then
+            echo "Found existing alias pointing to version: $CURRENT_VERSION"
+          else
+            echo "Alias '$ALIAS_NAME' does not exist. This will be treated as a first-time deployment."
+          fi
+
+          # 2. Publish a new version from $LATEST.
+          # Terraform has already updated $LATEST with the new image digest.
+          echo "Publishing new version for function '$FUNCTION_NAME'..."
+          # Use `|| true` to capture error output without exiting immediately
+          PUBLISH_OUTPUT=$(aws lambda publish-version \
             --function-name "$FUNCTION_NAME" \
             --description "Promote ${{ github.event.inputs.image_digest }}" \
-            --query Version \
-            --output text)
+            --output json 2>&1) || true
 
-          echo "Published new Lambda version: $NEW_VERSION"
+          # Check for ResourceConflictException, which means no code has changed.
+          if echo "$PUBLISH_OUTPUT" | grep -q "ResourceConflictException"; then
+            echo "No changes detected in the function's code or configuration."
+            echo "Skipping Lambda deployment as there is nothing new to deploy."
+            echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
+            exit 0 # Exit successfully
+          # Check for other errors by validating if the output is valid JSON with a .Version key
+          elif ! echo "$PUBLISH_OUTPUT" | jq -e .Version > /dev/null; then
+            echo "::error::Failed to publish new Lambda version. Output:"
+            echo "$PUBLISH_OUTPUT"
+            exit 1
+          fi
 
-          # 3. Handle initial deployment case (no alias exists yet)
-          if [ "$ALIAS_EXISTS" = "false" ] || [ -z "$CURRENT_VERSION" ]; then
-            echo "Alias does not exist. Creating alias pointing to version $NEW_VERSION"
+          NEW_VERSION=$(echo "$PUBLISH_OUTPUT" | jq -r .Version)
+          echo "Successfully published new version: $NEW_VERSION"
+
+          # 3. Handle first-time deployment (alias did not exist)
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "Creating new alias '$ALIAS_NAME' to point directly to version '$NEW_VERSION'."
             aws lambda create-alias \
               --function-name "$FUNCTION_NAME" \
               --name "$ALIAS_NAME" \
               --function-version "$NEW_VERSION" \
-              --description "Production alias for podinfo Lambda" || {
-                echo "Failed to create alias. Checking if it was created by another process..."
-                CURRENT_VERSION=$(aws lambda get-alias \
-                  --function-name "$FUNCTION_NAME" \
-                  --name "$ALIAS_NAME" \
-                  --query FunctionVersion \
-                  --output text 2>/dev/null || echo "")
-                if [ -n "$CURRENT_VERSION" ]; then
-                  echo "Alias exists now. Continuing with CodeDeploy..."
-                  ALIAS_EXISTS="true"
-                else
-                  echo "Error: Failed to create or find alias"
-                  exit 1
-                fi
-              }
-
-            # If we just created it, skip CodeDeploy for first deployment
-            if [ "$ALIAS_EXISTS" = "false" ]; then
-              echo "Alias created. Skipping CodeDeploy for initial deployment."
-              echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
-              exit 0
-            fi
-          fi
-
-          # 4. Validate we have different versions (required for CodeDeploy)
-          if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
-            echo "Error: Current version ($CURRENT_VERSION) and new version ($NEW_VERSION) are the same."
-            echo "This means no changes were detected. Skipping deployment."
+              --description "Production alias for podinfo Lambda"
+            echo "Alias created. Skipping CodeDeploy for this initial deployment."
             echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
-            exit 0
+            exit 0 # Exit successfully
           fi
 
-          if ! [[ "$NEW_VERSION" =~ ^[0-9]+$ ]]; then
-            echo "Error: Failed to publish new Lambda version"
-            exit 1
-          fi
+          # 4. If we are here, it's a standard deployment (not the first one, and code has changed)
+          echo "Proceeding with CodeDeploy."
+          echo "Current Version (for rollback): $CURRENT_VERSION"
+          echo "Target Version (new release): $NEW_VERSION"
 
-          if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ ]]; then
-            echo "Error: Current version is not a valid number: $CURRENT_VERSION"
-            exit 1
-          fi
-
-          echo "AppSpec CurrentVersion: $CURRENT_VERSION"
-          echo "AppSpec TargetVersion: $NEW_VERSION"
-
-          # 5. Export versions for use in next step
+          # Export variables for the next step
           echo "CURRENT_VERSION=$CURRENT_VERSION" >> $GITHUB_ENV
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
           echo "FUNCTION_NAME=$FUNCTION_NAME" >> $GITHUB_ENV
