@@ -19,6 +19,34 @@ locals {
 }
 
 ####################
+# ECR Repository Policy for Lambda
+####################
+data "aws_ecr_repository" "podinfo" {
+  name = split("/", var.ecr_repo_url)[1]  # Extract repo name from URL
+}
+
+resource "aws_ecr_repository_policy" "lambda_access" {
+  repository = data.aws_ecr_repository.podinfo.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "LambdaECRImageRetrievalPolicy"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+        Action = [
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer"
+        ]
+      }
+    ]
+  })
+}
+
+####################
 # Lambda Function
 ####################
 resource "aws_lambda_function" "podinfo" {
@@ -38,7 +66,10 @@ resource "aws_lambda_function" "podinfo" {
     }
   }
 
-  depends_on = [aws_iam_role_policy_attachment.lambda_basic]
+  depends_on = [
+    aws_iam_role_policy_attachment.lambda_basic,
+    aws_ecr_repository_policy.lambda_access
+  ]
 }
 
 ####################
