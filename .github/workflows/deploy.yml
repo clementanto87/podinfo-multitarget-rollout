@@ -71,8 +71,8 @@ jobs:
             "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --certificate-identity-regexp "https://github.com/.+"
-      
-      
+
+
 
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
@@ -123,17 +123,24 @@ jobs:
           ECR_REPO_URL: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-          APPSPEC_JSON=$(cat infra/lambda/appspec.yaml | yq -o=json | jq -R .)
+          # 1. Convert appspec.yaml to a single-line JSON string
+          APPSPEC_CONTENT_JSON=$(cat infra/lambda/appspec.yaml | yq -o=json)
+          # 2. Escape the JSON string for inclusion inside the 'content' field's double quotes
+          APPSPEC_JSON_ESCAPED=$(echo "$APPSPEC_CONTENT_JSON" | jq -R -s -c .)
+          # 3. Calculate SHA256
           APPSPEC_SHA256=$(sha256sum infra/lambda/appspec.yaml | cut -d' ' -f1)
+          
+          # 4. Create the final revision JSON file
           cat > appspec-content.json <<EOF
           {
             "revisionType": "AppSpecContent",
             "appSpecContent": {
-              "content": $APPSPEC_JSON,
+              "content": $APPSPEC_JSON_ESCAPED,
               "sha256": "$APPSPEC_SHA256"
             }
           }
           EOF
+          
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name "podinfo-lambda-${{ github.event.inputs.deploy_env }}" \
             --deployment-group-name "lambda-group-${{ github.event.inputs.deploy_env }}" \
@@ -146,10 +153,10 @@ jobs:
         if: env.LAMBDA_CODEDEPLOY_ID != ''
         run: |
           aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID"
-       
-       
-          
-          
+      
+      
+      
+      
 
       # -------------------------------------------------
       # EC2: Provision infra + create deployment bundle
@@ -204,9 +211,9 @@ jobs:
         if: env.EC2_CODEDEPLOY_ID != ''
         run: |
           aws deploy wait deployment-successful --deployment-id "$EC2_CODEDEPLOY_ID"    
-
       
-
+      
+      
       
 
       # -------------------------------------------------
