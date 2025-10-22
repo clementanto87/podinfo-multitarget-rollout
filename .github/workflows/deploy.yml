@@ -124,27 +124,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1. Convert appspec.yaml to JSON
-          APPSPEC_JSON=$(cat infra/lambda/appspec.yaml | yq -o=json -I=0)
+          # 1. Convert appspec.yaml to a compact JSON string (this will be the content)
+          APPSPEC_CONTENT=$(cat infra/lambda/appspec.yaml | yq -o=json -I=0 | tr -d '\n')
 
-          # 2. Calculate SHA256 of the JSON content (this is what goes in the 'content' field)
-          APPSPEC_SHA256=$(echo -n "$APPSPEC_JSON" | sha256sum | cut -d' ' -f1)
+          # 2. Calculate SHA256 of that exact content string
+          APPSPEC_SHA256=$(echo -n "$APPSPEC_CONTENT" | sha256sum | cut -d' ' -f1)
 
-          # 3. Escape the JSON for inclusion in the revision file
-          APPSPEC_JSON_ESCAPED=$(echo "$APPSPEC_JSON" | jq -R -s -c .)
+          # 3. Build the revision JSON using jq to ensure proper escaping
+          jq -n \
+            --arg content "$APPSPEC_CONTENT" \
+            --arg sha "$APPSPEC_SHA256" \
+            '{
+              revisionType: "AppSpecContent",
+              appSpecContent: {
+                content: $content,
+                sha256: $sha
+              }
+            }' > appspec-content.json
 
-          # 4. Create the revision JSON file
-          cat > appspec-content.json <<EOF
-          {
-            "revisionType": "AppSpecContent",
-            "appSpecContent": {
-              "content": $APPSPEC_JSON_ESCAPED,
-              "sha256": "$APPSPEC_SHA256"
-            }
-          }
-          EOF
-
-          # 5. Create the deployment
+          # 4. Create the deployment
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name "podinfo-lambda-${{ github.event.inputs.deploy_env }}" \
             --deployment-group-name "lambda-group-${{ github.event.inputs.deploy_env }}" \
@@ -152,11 +150,6 @@ jobs:
             --description "Deploy $ECR_REPO_URL@${{ github.event.inputs.image_digest }}" \
             --query deploymentId --output text)
           echo "LAMBDA_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
-
-      - name: Wait for Lambda CodeDeploy
-        if: env.LAMBDA_CODEDEPLOY_ID != ''
-        run: |
-          aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID"
       
       
       
