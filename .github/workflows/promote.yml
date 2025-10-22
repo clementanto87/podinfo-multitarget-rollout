@@ -91,14 +91,11 @@ jobs:
       # -------------------------------------------------
       # LAMBDA: Provision infra (re-apply) + trigger CodeDeploy
       # -------------------------------------------------
-      # NOTE: For promotion, a `terraform apply` is included to ensure
-      # all infrastructure variables (like the new image digest) are set,
-      # aligning with the deploy.yaml pattern.
       - name: Deploy Lambda infra (Terraform)
         working-directory: infra/lambda
         env:
           TF_VAR_region: ${{ env.AWS_REGION }}
-          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }}
           TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
           TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
@@ -108,7 +105,6 @@ jobs:
             -backend-config="key=infra/lambda/${{ env.DEPLOY_ENV }}.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=terraform-state-locks"
-          # Apply to update any variables that depend on image_digest or ensure infra is present/correct
           terraform apply -auto-approve \
             -var="region=${{ env.AWS_REGION }}" \
             -var="deploy_env=${{ env.DEPLOY_ENV }}" \
@@ -119,6 +115,8 @@ jobs:
       - name: Generate AppSpec for Lambda CodeDeploy (prod)
         working-directory: infra/lambda
         run: |
+          # 🚨 FIX: Removed hardcoded CurrentVersion and TargetVersion.
+          # CodeDeploy should find the new version created by Terraform.
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
@@ -127,8 +125,8 @@ jobs:
                 Properties:
                   Name: "podinfo-${{ env.DEPLOY_ENV }}"
                   Alias: "live"
-                  CurrentVersion: "1"
-                  TargetVersion: "2"
+                  # CurrentVersion: "1"  <-- REMOVED
+                  # TargetVersion: "2"   <-- REMOVED
           EOF
 
       - name: Create Lambda CodeDeploy Deployment (prod)
@@ -164,10 +162,24 @@ jobs:
             --query deploymentId --output text)
           echo "LAMBDA_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
 
+      # --- START OF DIAGNOSTIC STEPS ---
       - name: Wait for Lambda CodeDeploy (prod)
         if: env.LAMBDA_CODEDEPLOY_ID != ''
+        # Added pipefail and changed to run always with status check later
         run: |
-          aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID"
+          set +e # Don't exit on failure here so we can get deployment details
+          aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID" || DEPLOYMENT_STATUS=$?
+          set -e
+          echo "DEPLOYMENT_STATUS=$DEPLOYMENT_STATUS" >> $GITHUB_ENV
+
+      - name: Get CodeDeploy Deployment Status and Failure Details
+        if: env.LAMBDA_CODEDEPLOY_ID != '' && env.DEPLOYMENT_STATUS != '0'
+        run: |
+          echo "--- AWS CodeDeploy Failure Details for $LAMBDA_CODEDEPLOY_ID ---"
+          aws deploy get-deployment --deployment-id "$LAMBDA_CODEDEPLOY_ID" --output json
+          echo "---------------------------------------------------------"
+          exit 1 # Fail the step if the waiter failed
+      # --- END OF DIAGNOSTIC STEPS ---
 
       # -------------------------------------------------
       # EC2: Re-apply infra + deploy new bundle
@@ -176,7 +188,7 @@ jobs:
         working-directory: infra/ec2
         env:
           TF_VAR_region: ${{ env.AWS_REGION }}
-          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }}
           TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
           TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
@@ -186,7 +198,6 @@ jobs:
             -backend-config="key=infra/ec2/${{ env.DEPLOY_ENV }}.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=terraform-state-locks"
-          # Apply to update any variables that depend on image_digest or ensure infra is present/correct
           terraform apply -auto-approve \
             -var="region=${{ env.AWS_REGION }}" \
             -var="deploy_env=${{ env.DEPLOY_ENV }}" \
@@ -206,7 +217,6 @@ jobs:
           zip -r ../deployment.zip .
 
       - name: Upload bundle to S3
-        # Match the naming convention from deploy.yaml
         run: |
           aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip
 
@@ -230,7 +240,6 @@ jobs:
       # -------------------------------------------------
       - name: Fetch prod endpoints
         run: |
-          # Use env.DEPLOY_ENV (prod) in the path
           LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
           ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
           echo "LAMBDA_URL=$LAMBDA_URL" >> $GITHUB_ENV
