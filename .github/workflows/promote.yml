@@ -173,7 +173,16 @@ jobs:
             exit 0 # Exit successfully
           fi
 
-          # 4. If we are here, it's a standard deployment (not the first one, and code has changed)
+          # 4. If we are here, it's a standard deployment. Validate versions before proceeding.
+          if ! [[ "$CURRENT_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid CURRENT_VERSION: '$CURRENT_VERSION'. Must be a positive integer."
+            exit 1
+          fi
+          if ! [[ "$NEW_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid NEW_VERSION: '$NEW_VERSION'. Must be a positive integer."
+            exit 1
+          fi
+
           echo "Proceeding with CodeDeploy."
           echo "Current Version (for rollback): $CURRENT_VERSION"
           echo "Target Version (new release): $NEW_VERSION"
@@ -191,12 +200,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build the AppSpec JSON. The AWS API expects string values for versions.
+          # Build the AppSpec JSON with proper integer types, as required by the CodeDeploy API.
           jq -n \
             --arg fname "$FUNCTION_NAME" \
             --arg alias "$ALIAS_NAME" \
-            --arg current "$CURRENT_VERSION" \
-            --arg target "$NEW_VERSION" \
+            --argjson current "$CURRENT_VERSION" \
+            --argjson target "$NEW_VERSION" \
             '{
               version: "0.0",
               Resources: [{
