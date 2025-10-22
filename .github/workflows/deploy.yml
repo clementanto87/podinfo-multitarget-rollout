@@ -125,10 +125,12 @@ jobs:
           set -euo pipefail
           # 1. Convert appspec.yaml to a single-line JSON string
           APPSPEC_CONTENT_JSON=$(cat infra/lambda/appspec.yaml | yq -o=json)
+          
           # 2. Escape the JSON string for inclusion inside the 'content' field's double quotes
           APPSPEC_JSON_ESCAPED=$(echo "$APPSPEC_CONTENT_JSON" | jq -R -s -c .)
-          # 3. Calculate SHA256
-          APPSPEC_SHA256=$(sha256sum infra/lambda/appspec.yaml | cut -d' ' -f1)
+          
+          # 3. FIX: Calculate SHA256 of the *raw* AppSpec file content, removing the trailing newline
+          APPSPEC_SHA256=$(cat infra/lambda/appspec.yaml | tr -d '\n' | sha256sum | cut -d' ' -f1)
           
           # 4. Create the final revision JSON file
           cat > appspec-content.json <<EOF
