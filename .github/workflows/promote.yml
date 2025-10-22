@@ -95,7 +95,7 @@ jobs:
         working-directory: infra/lambda
         env:
           TF_VAR_region: ${{ env.AWS_REGION }}
-          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }}
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
           TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
           TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
@@ -105,6 +105,7 @@ jobs:
             -backend-config="key=infra/lambda/${{ env.DEPLOY_ENV }}.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=terraform-state-locks"
+          # Apply to update any variables that depend on image_digest or ensure infra is present/correct
           terraform apply -auto-approve \
             -var="region=${{ env.AWS_REGION }}" \
             -var="deploy_env=${{ env.DEPLOY_ENV }}" \
@@ -115,18 +116,41 @@ jobs:
       - name: Generate AppSpec for Lambda CodeDeploy (prod)
         working-directory: infra/lambda
         run: |
-          # 🚨 FIX: Removed hardcoded CurrentVersion and TargetVersion.
-          # CodeDeploy should find the new version created by Terraform.
+          set -euo pipefail
+          FUNCTION_NAME="podinfo-${{ env.DEPLOY_ENV }}"
+
+          # 1. Fetch the current published version of the 'live' alias.
+          # If the alias doesn't exist (first deployment), default to '1'.
+          CURRENT_VERSION=$(aws lambda get-alias \
+            --function-name "$FUNCTION_NAME" \
+            --name live \
+            --query FunctionVersion \
+            --output text 2>/dev/null || echo "1")
+          
+          # 2. Calculate the TargetVersion. CodeDeploy manages the new version, 
+          # which is always one higher than the current published version.
+          if [ "$CURRENT_VERSION" = "\$LATEST" ] || [ "$CURRENT_VERSION" = "1" ]; then
+            # If it's the first deploy or points to $LATEST, assume the target is 2.
+            TARGET_VERSION="2"
+          else
+            # Calculate the next integer version
+            TARGET_VERSION=$((CURRENT_VERSION + 1))
+          fi
+          
+          echo "Current Lambda Live Version: $CURRENT_VERSION"
+          echo "Calculated Lambda Target Version: $TARGET_VERSION"
+
+          # 3. Create the AppSpec with the required dynamic versions
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
             - TargetService:
                 Type: AWS::Lambda::Function
                 Properties:
-                  Name: "podinfo-${{ env.DEPLOY_ENV }}"
+                  Name: "$FUNCTION_NAME"
                   Alias: "live"
-                  # CurrentVersion: "1"  <-- REMOVED
-                  # TargetVersion: "2"   <-- REMOVED
+                  CurrentVersion: "$CURRENT_VERSION"
+                  TargetVersion: "$TARGET_VERSION"
           EOF
 
       - name: Create Lambda CodeDeploy Deployment (prod)
@@ -162,7 +186,6 @@ jobs:
             --query deploymentId --output text)
           echo "LAMBDA_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
 
-      # --- START OF DIAGNOSTIC STEPS ---
       - name: Wait for Lambda CodeDeploy (prod)
         if: env.LAMBDA_CODEDEPLOY_ID != ''
         # Added pipefail and changed to run always with status check later
@@ -179,7 +202,6 @@ jobs:
           aws deploy get-deployment --deployment-id "$LAMBDA_CODEDEPLOY_ID" --output json
           echo "---------------------------------------------------------"
           exit 1 # Fail the step if the waiter failed
-      # --- END OF DIAGNOSTIC STEPS ---
 
       # -------------------------------------------------
       # EC2: Re-apply infra + deploy new bundle
@@ -188,7 +210,7 @@ jobs:
         working-directory: infra/ec2
         env:
           TF_VAR_region: ${{ env.AWS_REGION }}
-          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }}
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
           TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
           TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
@@ -217,6 +239,7 @@ jobs:
           zip -r ../deployment.zip .
 
       - name: Upload bundle to S3
+        # Match the naming convention from deploy.yaml
         run: |
           aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip
 
@@ -240,6 +263,7 @@ jobs:
       # -------------------------------------------------
       - name: Fetch prod endpoints
         run: |
+          # Use env.DEPLOY_ENV (prod) in the path
           LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
           ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
           echo "LAMBDA_URL=$LAMBDA_URL" >> $GITHUB_ENV
