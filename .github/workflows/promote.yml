@@ -15,7 +15,7 @@ permissions:
 env:
   AWS_REGION: eu-west-1
   IMAGE_NAME: podinfo
-  DEPLOY_ENV: prod
+  DEPLOY_ENV: prod # This is used as deploy_env in the promote job
   AWS_ACCOUNT_ID: "910246205478"
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
       url: https://console.aws.amazon.com/
     steps:
       - name: Confirm Promotion
-        run: echo "Awaiting manual approval before promoting to production..."
+        run: echo "Awaiting manual approval before promoting to production for image ${{ github.event.inputs.image_digest }}"
 
   promote:
     name: Deploy to Production (Dual-Target)
@@ -42,6 +42,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq zip
+          # Ensure yq is installed exactly as in the dev workflow
           curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
           chmod +x /usr/local/bin/yq
 
@@ -55,19 +56,32 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Verify Cosign signature (keyless)
+      - name: Verify image signature (cosign keyless)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
+          COSIGN_EXPERIMENTAL: "1" # Add experimental flag as in deploy.yaml
         run: |
           set -euo pipefail
-          echo "Verifying cosign signature for prod promotion..."
-          if ! command -v cosign >/dev/null 2>&1; then
-            COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep tag_name | cut -d '"' -f4)
-            curl -sSL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
-            chmod +x /usr/local/bin/cosign
+          echo "Verifying image signature for $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
+
+          # --- Install latest stable Cosign (Copied from deploy.yaml) ---
+          COSIGN_VERSION=$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest | jq -r .tag_name)
+          if [ -z "$COSIGN_VERSION" ] || [ "$COSIGN_VERSION" = "null" ]; then
+            COSIGN_VERSION="v2.2.4" # fallback safe default
           fi
-          cosign verify --keyless "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
+          echo "Installing Cosign $COSIGN_VERSION"
+          curl -fsSL -o /usr/local/bin/cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          chmod +x /usr/local/bin/cosign
+          cosign version
+          
+          # --- Verify image signature (keyless OIDC mode) ---
+          # Use the exact command from deploy.yaml
+          cosign verify \
+            "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "https://github.com/.+"
 
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
@@ -75,18 +89,32 @@ jobs:
           terraform_version: 1.5.6
 
       # -------------------------------------------------
-      # LAMBDA: Reuse existing infra, trigger CodeDeploy
+      # LAMBDA: Provision infra (re-apply) + trigger CodeDeploy
       # -------------------------------------------------
-      - name: Refresh Lambda infra state (prod)
+      # NOTE: For promotion, a `terraform apply` is included to ensure
+      # all infrastructure variables (like the new image digest) are set,
+      # aligning with the deploy.yaml pattern.
+      - name: Deploy Lambda infra (Terraform)
         working-directory: infra/lambda
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
+          TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
+          TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
           terraform init -input=false \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=infra/lambda/prod.tfstate" \
+            -backend-config="key=infra/lambda/${{ env.DEPLOY_ENV }}.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=terraform-state-locks"
-          # No apply — infra already exists
+          # Apply to update any variables that depend on image_digest or ensure infra is present/correct
+          terraform apply -auto-approve \
+            -var="region=${{ env.AWS_REGION }}" \
+            -var="deploy_env=${{ env.DEPLOY_ENV }}" \
+            -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
+            -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
+            -var="image_digest=${{ github.event.inputs.image_digest }}"
 
       - name: Generate AppSpec for Lambda CodeDeploy (prod)
         working-directory: infra/lambda
@@ -97,7 +125,7 @@ jobs:
             - TargetService:
                 Type: AWS::Lambda::Function
                 Properties:
-                  Name: "podinfo-prod"
+                  Name: "podinfo-${{ env.DEPLOY_ENV }}"
                   Alias: "live"
                   CurrentVersion: "1"
                   TargetVersion: "2"
@@ -108,22 +136,31 @@ jobs:
           ECR_REPO_URL: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-          APPSPEC_JSON=$(cat infra/lambda/appspec.yaml | yq -o=json | jq -R .)
-          APPSPEC_SHA256=$(sha256sum infra/lambda/appspec.yaml | cut -d' ' -f1)
-          cat > appspec-content.json <<EOF
-          {
-            "revisionType": "AppSpecContent",
-            "appSpecContent": {
-              "content": $APPSPEC_JSON,
-              "sha256": "$APPSPEC_SHA256"
-            }
-          }
-          EOF
+          
+          # 1. Convert appspec.yaml to a compact JSON string and remove newlines (MATCHES deploy.yaml)
+          APPSPEC_CONTENT=$(cat infra/lambda/appspec.yaml | yq -o=json -I=0 | tr -d '\n')
+          
+          # 2. Calculate SHA256 of that exact content string (MATCHES deploy.yaml)
+          APPSPEC_SHA256=$(echo -n "$APPSPEC_CONTENT" | sha256sum | cut -d' ' -f1)
+          
+          # 3. Build the revision JSON using jq to ensure proper escaping (MATCHES deploy.yaml)
+          jq -n \
+            --arg content "$APPSPEC_CONTENT" \
+            --arg sha "$APPSPEC_SHA256" \
+            '{
+              revisionType: "AppSpecContent",
+              appSpecContent: {
+                content: $content,
+                sha256: $sha
+              }
+            }' > appspec-content.json
+
+          # 4. Create the deployment
           DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name "podinfo-lambda-prod" \
-            --deployment-group-name "lambda-group-prod" \
+            --application-name "podinfo-lambda-${{ env.DEPLOY_ENV }}" \
+            --deployment-group-name "lambda-group-${{ env.DEPLOY_ENV }}" \
             --revision file://appspec-content.json \
-            --description "Promote ${{ github.event.inputs.image_digest }}" \
+            --description "Deploy $ECR_REPO_URL@${{ github.event.inputs.image_digest }}" \
             --query deploymentId --output text)
           echo "LAMBDA_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
 
@@ -133,22 +170,35 @@ jobs:
           aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID"
 
       # -------------------------------------------------
-      # EC2: Reuse infra, deploy new bundle
+      # EC2: Re-apply infra + deploy new bundle
       # -------------------------------------------------
-      - name: Refresh EC2 infra state (prod)
+      - name: Deploy EC2 infra (Terraform)
         working-directory: infra/ec2
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
+          TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
+          TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
           terraform init -input=false \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=infra/ec2/prod.tfstate" \
+            -backend-config="key=infra/ec2/${{ env.DEPLOY_ENV }}.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=terraform-state-locks"
+          # Apply to update any variables that depend on image_digest or ensure infra is present/correct
+          terraform apply -auto-approve \
+            -var="region=${{ env.AWS_REGION }}" \
+            -var="deploy_env=${{ env.DEPLOY_ENV }}" \
+            -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
+            -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
+            -var="image_digest=${{ github.event.inputs.image_digest }}"
 
       - name: Create EC2 deployment bundle (prod)
         run: |
           mkdir -p deployment/scripts
           cp -r scripts/*.sh scripts/appspec.yml deployment/scripts/
+          # Inject image digest into environment (optional)
           echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}@${{ github.event.inputs.image_digest }}" > deployment/scripts/.env
           echo "SUPER_SECRET_TOKEN_ARN=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" >> deployment/scripts/.env
           echo "AWS_REGION=${{ env.AWS_REGION }}" >> deployment/scripts/.env
@@ -156,15 +206,16 @@ jobs:
           zip -r ../deployment.zip .
 
       - name: Upload bundle to S3
+        # Match the naming convention from deploy.yaml
         run: |
-          aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-prod-${{ github.run_id }}.zip
+          aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip
 
       - name: Create EC2 CodeDeploy Deployment (prod)
         run: |
           DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name "podinfo-ec2-prod" \
-            --deployment-group-name "ec2-group-prod" \
-            --s3-location bucket=${{ secrets.TF_STATE_BUCKET }},key=deployments/podinfo-prod-${{ github.run_id }}.zip,bundleType=zip \
+            --application-name "podinfo-ec2-${{ env.DEPLOY_ENV }}" \
+            --deployment-group-name "ec2-group-${{ env.DEPLOY_ENV }}" \
+            --s3-location bucket=${{ secrets.TF_STATE_BUCKET }},key=deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip,bundleType=zip \
             --description "Promote ${{ github.event.inputs.image_digest }}" \
             --query deploymentId --output text)
           echo "EC2_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
@@ -179,6 +230,7 @@ jobs:
       # -------------------------------------------------
       - name: Fetch prod endpoints
         run: |
+          # Use env.DEPLOY_ENV (prod) in the path
           LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
           ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
           echo "LAMBDA_URL=$LAMBDA_URL" >> $GITHUB_ENV
@@ -201,7 +253,7 @@ jobs:
         run: |
           echo "### Production Promotion Summary" >> $GITHUB_STEP_SUMMARY
           echo "- Image digest: \`${{ github.event.inputs.image_digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Environment: prod" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: ${{ env.DEPLOY_ENV }}" >> $GITHUB_STEP_SUMMARY
           echo "- Promoted by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
           echo "- Lambda URL: ${{ env.LAMBDA_URL }}" >> $GITHUB_STEP_SUMMARY
           echo "- ALB DNS: ${{ env.ALB_DNS }}" >> $GITHUB_STEP_SUMMARY
