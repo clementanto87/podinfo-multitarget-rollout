@@ -121,34 +121,54 @@ jobs:
           ALIAS_NAME="live"
 
           # 1. Check if alias exists and get its current version
+          # Use a more robust check that won't confuse errors with missing aliases
+          ALIAS_EXISTS="false"
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
             --name "$ALIAS_NAME" \
             --query FunctionVersion \
-            --output text 2>/dev/null || echo "")
-          
+            --output text 2>/dev/null && ALIAS_EXISTS="true" || echo "")
+
           # 2. Publish a new version from $LATEST (which Terraform just updated)
           NEW_VERSION=$(aws lambda publish-version \
             --function-name "$FUNCTION_NAME" \
             --description "Promote ${{ github.event.inputs.image_digest }}" \
             --query Version \
             --output text)
-          
+
           echo "Published new Lambda version: $NEW_VERSION"
-          
+
           # 3. Handle initial deployment case (no alias exists yet)
-          if [ -z "$CURRENT_VERSION" ] || ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ ]]; then
-            echo "Alias does not exist or is invalid. Creating alias pointing to version $NEW_VERSION"
+          if [ "$ALIAS_EXISTS" = "false" ] || [ -z "$CURRENT_VERSION" ]; then
+            echo "Alias does not exist. Creating alias pointing to version $NEW_VERSION"
             aws lambda create-alias \
               --function-name "$FUNCTION_NAME" \
               --name "$ALIAS_NAME" \
               --function-version "$NEW_VERSION" \
-              --description "Production alias for podinfo Lambda"
-            echo "Alias created. Skipping CodeDeploy for initial deployment."
-            echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
-            exit 0
+              --description "Production alias for podinfo Lambda" || {
+                echo "Failed to create alias. Checking if it was created by another process..."
+                CURRENT_VERSION=$(aws lambda get-alias \
+                  --function-name "$FUNCTION_NAME" \
+                  --name "$ALIAS_NAME" \
+                  --query FunctionVersion \
+                  --output text 2>/dev/null || echo "")
+                if [ -n "$CURRENT_VERSION" ]; then
+                  echo "Alias exists now. Continuing with CodeDeploy..."
+                  ALIAS_EXISTS="true"
+                else
+                  echo "Error: Failed to create or find alias"
+                  exit 1
+                fi
+              }
+
+            # If we just created it, skip CodeDeploy for first deployment
+            if [ "$ALIAS_EXISTS" = "false" ]; then
+              echo "Alias created. Skipping CodeDeploy for initial deployment."
+              echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
+              exit 0
+            fi
           fi
-          
+
           # 4. Validate we have different versions (required for CodeDeploy)
           if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
             echo "Error: Current version ($CURRENT_VERSION) and new version ($NEW_VERSION) are the same."
@@ -156,12 +176,12 @@ jobs:
             echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
             exit 0
           fi
-          
+
           if ! [[ "$NEW_VERSION" =~ ^[0-9]+$ ]]; then
             echo "Error: Failed to publish new Lambda version"
             exit 1
           fi
-          
+
           echo "AppSpec CurrentVersion: $CURRENT_VERSION"
           echo "AppSpec TargetVersion: $NEW_VERSION"
 
