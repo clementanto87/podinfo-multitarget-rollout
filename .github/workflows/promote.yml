@@ -120,28 +120,38 @@ jobs:
           FUNCTION_NAME="podinfo-${{ env.DEPLOY_ENV }}"
           ALIAS_NAME="live"
 
-          # 1. Get the current *numeric* version the 'live' alias points to (CurrentVersion).
-          # This must match what CodeDeploy sees immediately before it runs to avoid mismatch error.
+          # 1. Publish a new version from $LATEST (which Terraform just updated)
+          #    This ensures we have a stable, immutable version to deploy
+          NEW_VERSION=$(aws lambda publish-version \
+            --function-name "$FUNCTION_NAME" \
+            --description "Promote ${{ github.event.inputs.image_digest }}" \
+            --query Version \
+            --output text)
+          
+          echo "Published new Lambda version: $NEW_VERSION"
+          
+          # 2. Get what version the alias currently points to
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
             --name "$ALIAS_NAME" \
             --query FunctionVersion \
-            --output text 2>/dev/null || echo "1")
+            --output text 2>/dev/null || echo "$NEW_VERSION")
           
-          # 2. Ensure CURRENT_VERSION is a valid positive integer.
-          if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ && "$CURRENT_VERSION" -gt 0 ]]; then
-            echo "Alias version is not an integer. Setting CurrentVersion to 1."
-            CURRENT_VERSION="1"
+          # 3. Validate versions are numeric
+          if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ ]]; then
+            echo "Invalid CurrentVersion, using published version"
+            CURRENT_VERSION="$NEW_VERSION"
           fi
           
-          # 3. TargetVersion is the next logical version. CodeDeploy will publish this new version 
-          # from the $LATEST function configuration updated by Terraform.
-          TARGET_VERSION=$((CURRENT_VERSION + 1))
+          if ! [[ "$NEW_VERSION" =~ ^[0-9]+$ ]]; then
+            echo "Error: Failed to publish new Lambda version"
+            exit 1
+          fi
           
           echo "AppSpec CurrentVersion: $CURRENT_VERSION"
-          echo "AppSpec TargetVersion: $TARGET_VERSION"
+          echo "AppSpec TargetVersion: $NEW_VERSION"
 
-          # 4. Create the AppSpec with dynamic values
+          # 4. Create the AppSpec with the actual published version
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
@@ -151,7 +161,7 @@ jobs:
                   Name: "$FUNCTION_NAME"
                   Alias: "$ALIAS_NAME"
                   CurrentVersion: "$CURRENT_VERSION"
-                  TargetVersion: "$TARGET_VERSION"
+                  TargetVersion: "$NEW_VERSION"
           EOF
 
       - name: Create Lambda CodeDeploy Deployment (prod)
