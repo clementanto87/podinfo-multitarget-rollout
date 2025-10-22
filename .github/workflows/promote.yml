@@ -186,6 +186,7 @@ jobs:
           echo "AppSpec TargetVersion: $NEW_VERSION"
 
           # 5. Create the AppSpec with the actual published version
+          # IMPORTANT: CurrentVersion and TargetVersion must be unquoted integers
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
@@ -194,8 +195,8 @@ jobs:
                 Properties:
                   Name: "$FUNCTION_NAME"
                   Alias: "$ALIAS_NAME"
-                  CurrentVersion: "$CURRENT_VERSION"
-                  TargetVersion: "$NEW_VERSION"
+                  CurrentVersion: $CURRENT_VERSION
+                  TargetVersion: $NEW_VERSION
           EOF
 
       - name: Create Lambda CodeDeploy Deployment (prod)
