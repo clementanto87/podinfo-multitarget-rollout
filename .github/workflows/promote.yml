@@ -121,7 +121,6 @@ jobs:
           ALIAS_NAME="live"
 
           # 1. Check if alias exists and get its current version
-          # Use a more robust check that won't confuse errors with missing aliases
           ALIAS_EXISTS="false"
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
@@ -182,22 +181,19 @@ jobs:
             exit 1
           fi
 
+          if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ ]]; then
+            echo "Error: Current version is not a valid number: $CURRENT_VERSION"
+            exit 1
+          fi
+
           echo "AppSpec CurrentVersion: $CURRENT_VERSION"
           echo "AppSpec TargetVersion: $NEW_VERSION"
 
-          # 5. Create the AppSpec with the actual published version
-          # IMPORTANT: CurrentVersion and TargetVersion must be unquoted integers
-          cat > appspec.yaml <<EOF
-          version: 0.0
-          Resources:
-            - TargetService:
-                Type: AWS::Lambda::Function
-                Properties:
-                  Name: "$FUNCTION_NAME"
-                  Alias: "$ALIAS_NAME"
-                  CurrentVersion: $CURRENT_VERSION
-                  TargetVersion: $NEW_VERSION
-          EOF
+          # 5. Export versions for use in next step
+          echo "CURRENT_VERSION=$CURRENT_VERSION" >> $GITHUB_ENV
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          echo "FUNCTION_NAME=$FUNCTION_NAME" >> $GITHUB_ENV
+          echo "ALIAS_NAME=$ALIAS_NAME" >> $GITHUB_ENV
 
       - name: Create Lambda CodeDeploy Deployment (prod)
         if: env.SKIP_LAMBDA_CODEDEPLOY != 'true'
@@ -205,14 +201,39 @@ jobs:
           ECR_REPO_URL: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-          
-          # 1. Convert appspec.yaml to a compact JSON string and remove newlines (MATCHES deploy.yaml)
-          APPSPEC_CONTENT=$(cat infra/lambda/appspec.yaml | yq -o=json -I=0 | tr -d '\n')
-          
-          # 2. Calculate SHA256 of that exact content string (MATCHES deploy.yaml)
+
+          # Build the AppSpec JSON directly with proper integer types using jq
+          # This ensures CurrentVersion and TargetVersion are integers, not strings
+          jq -n \
+            --arg fname "$FUNCTION_NAME" \
+            --arg alias "$ALIAS_NAME" \
+            --argjson current "$CURRENT_VERSION" \
+            --argjson target "$NEW_VERSION" \
+            '{
+              version: "0.0",
+              Resources: [{
+                TargetService: {
+                  Type: "AWS::Lambda::Function",
+                  Properties: {
+                    Name: $fname,
+                    Alias: $alias,
+                    CurrentVersion: $current,
+                    TargetVersion: $target
+                  }
+                }
+              }]
+            }' | tr -d '\n' > appspec-content.json
+
+          # Read the content
+          APPSPEC_CONTENT=$(cat appspec-content.json)
+
+          # Calculate SHA256
           APPSPEC_SHA256=$(echo -n "$APPSPEC_CONTENT" | sha256sum | cut -d' ' -f1)
-          
-          # 3. Build the revision JSON using jq to ensure proper escaping (MATCHES deploy.yaml)
+
+          echo "AppSpec Content: $APPSPEC_CONTENT"
+          echo "AppSpec SHA256: $APPSPEC_SHA256"
+
+          # Build the revision JSON
           jq -n \
             --arg content "$APPSPEC_CONTENT" \
             --arg sha "$APPSPEC_SHA256" \
@@ -222,13 +243,13 @@ jobs:
                 content: $content,
                 sha256: $sha
               }
-            }' > appspec-content.json
+            }' > revision.json
 
-          # 4. Create the deployment
+          # Create the deployment
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name "podinfo-lambda-${{ env.DEPLOY_ENV }}" \
             --deployment-group-name "lambda-group-${{ env.DEPLOY_ENV }}" \
-            --revision file://appspec-content.json \
+            --revision file://revision.json \
             --description "Deploy $ECR_REPO_URL@${{ github.event.inputs.image_digest }}" \
             --query deploymentId --output text)
           echo "LAMBDA_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
