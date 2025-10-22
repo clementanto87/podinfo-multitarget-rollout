@@ -118,29 +118,30 @@ jobs:
         run: |
           set -euo pipefail
           FUNCTION_NAME="podinfo-${{ env.DEPLOY_ENV }}"
+          ALIAS_NAME="live"
 
-          # 1. Fetch the current published version of the 'live' alias.
-          # Use "2>/dev/null || echo '1'" to default to '1' if the alias doesn't exist.
+          # 1. Get the current *numeric* version the 'live' alias points to (CurrentVersion).
+          # This must match what CodeDeploy sees immediately before it runs.
           CURRENT_VERSION=$(aws lambda get-alias \
             --function-name "$FUNCTION_NAME" \
-            --name live \
+            --name "$ALIAS_NAME" \
             --query FunctionVersion \
             --output text 2>/dev/null || echo "1")
           
-          # 2. Validate CURRENT_VERSION is a positive integer. Fallback to '1' if not.
-          # This specifically fixes the "must be a valid positive integer" error.
+          # 2. Ensure CURRENT_VERSION is a valid positive integer.
           if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+$ && "$CURRENT_VERSION" -gt 0 ]]; then
-            echo "Current version derived from alias ('$CURRENT_VERSION') is not a positive integer. Setting to 1 for initial deploy or fallback."
+            echo "Alias version is not an integer. Setting CurrentVersion to 1."
             CURRENT_VERSION="1"
           fi
           
-          # 3. Calculate the TargetVersion. It is always CURRENT_VERSION + 1.
+          # 3. TargetVersion is the next logical version. CodeDeploy will publish this new version 
+          # from the $LATEST function configuration updated by Terraform.
           TARGET_VERSION=$((CURRENT_VERSION + 1))
           
-          echo "Current Lambda Live Version: $CURRENT_VERSION"
-          echo "Calculated Lambda Target Version: $TARGET_VERSION"
+          echo "AppSpec CurrentVersion: $CURRENT_VERSION"
+          echo "AppSpec TargetVersion: $TARGET_VERSION"
 
-          # 4. Create the AppSpec with the required dynamic versions
+          # 4. Create the AppSpec
           cat > appspec.yaml <<EOF
           version: 0.0
           Resources:
@@ -148,7 +149,7 @@ jobs:
                 Type: AWS::Lambda::Function
                 Properties:
                   Name: "$FUNCTION_NAME"
-                  Alias: "live"
+                  Alias: "$ALIAS_NAME"
                   CurrentVersion: "$CURRENT_VERSION"
                   TargetVersion: "$TARGET_VERSION"
           EOF
