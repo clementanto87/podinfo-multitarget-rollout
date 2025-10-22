@@ -21,12 +21,8 @@ locals {
 ####################
 # ECR Repository Policy for Lambda
 ####################
-data "aws_ecr_repository" "podinfo" {
-  name = split("/", var.ecr_repo_url)[1]  # Extract repo name from URL
-}
-
 resource "aws_ecr_repository_policy" "lambda_access" {
-  repository = data.aws_ecr_repository.podinfo.name
+  repository = "podinfo"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -71,10 +67,6 @@ resource "aws_lambda_function" "podinfo" {
     aws_ecr_repository_policy.lambda_access
   ]
 }
-
-####################
-# Lambda Execution Role
-####################
 resource "aws_iam_role" "lambda_exec" {
   name = "podinfo-lambda-exec-${var.deploy_env}"
   assume_role_policy = jsonencode({
