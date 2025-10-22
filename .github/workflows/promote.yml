@@ -191,13 +191,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build the AppSpec JSON directly with proper integer types using jq
-          # This ensures CurrentVersion and TargetVersion are integers, not strings
+          # Build the AppSpec JSON. The AWS API expects string values for versions.
           jq -n \
             --arg fname "$FUNCTION_NAME" \
             --arg alias "$ALIAS_NAME" \
-            --argjson current "$CURRENT_VERSION" \
-            --argjson target "$NEW_VERSION" \
+            --arg current "$CURRENT_VERSION" \
+            --arg target "$NEW_VERSION" \
             '{
               version: "0.0",
               Resources: [{
