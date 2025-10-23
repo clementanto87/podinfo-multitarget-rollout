@@ -154,6 +154,63 @@ jobs:
       
       
       
+
+      # -------------------------------------------------
+      # EC2: Provision infra + create deployment bundle
+      # -------------------------------------------------
+      - name: Deploy EC2 infra (Terraform)
+        working-directory: infra/ec2
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_deploy_env: ${{ github.event.inputs.deploy_env }}
+          TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
+          TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/ec2/${{ github.event.inputs.deploy_env }}.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-state-locks"
+          terraform apply -auto-approve \
+            -var="region=${{ env.AWS_REGION }}" \
+            -var="deploy_env=${{ github.event.inputs.deploy_env }}" \
+            -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
+            -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
+            -var="image_digest=${{ github.event.inputs.image_digest }}"
+
+      - name: Create EC2 deployment bundle
+        run: |
+          mkdir -p deployment/scripts
+          cp -r scripts/*.sh scripts/appspec.yml deployment/scripts/
+          # Inject image digest into environment (optional)
+          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}@${{ github.event.inputs.image_digest }}" > deployment/scripts/.env
+          echo "SUPER_SECRET_TOKEN_ARN=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" >> deployment/scripts/.env
+          echo "AWS_REGION=${{ env.AWS_REGION }}" >> deployment/scripts/.env
+          cd deployment
+          zip -r ../deployment.zip .
+
+      - name: Upload bundle to S3
+        run: |
+          aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-${{ github.event.inputs.deploy_env }}-${{ github.run_id }}.zip
+
+      - name: Create EC2 CodeDeploy Deployment
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name "podinfo-ec2-${{ github.event.inputs.deploy_env }}" \
+            --deployment-group-name "ec2-group-${{ github.event.inputs.deploy_env }}" \
+            --s3-location bucket=${{ secrets.TF_STATE_BUCKET }},key=deployments/podinfo-${{ github.event.inputs.deploy_env }}-${{ github.run_id }}.zip,bundleType=zip \
+            --description "Deploy ${{ github.event.inputs.image_digest }}" \
+            --query deploymentId --output text)
+          echo "EC2_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+
+      - name: Wait for EC2 CodeDeploy
+        if: env.EC2_CODEDEPLOY_ID != ''
+        run: |
+          aws deploy wait deployment-successful --deployment-id "$EC2_CODEDEPLOY_ID"    
+      
+      
+      
       
 
       # -------------------------------------------------
@@ -162,20 +219,22 @@ jobs:
       - name: Fetch endpoints
         run: |
           LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
-        
+          ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
           echo "LAMBDA_URL=$LAMBDA_URL" >> $GITHUB_ENV
-          
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
 
       - name: Run final smoke tests
         env:
           LAMBDA_URL: ${{ env.LAMBDA_URL }}
-
+          ALB_DNS: ${{ env.ALB_DNS }}
         run: |
           set -euo pipefail
           if [ -n "$LAMBDA_URL" ]; then
             curl -sfS "$LAMBDA_URL/healthz"
           fi
-          
+          if [ -n "$ALB_DNS" ]; then
+            curl -sfS "http://$ALB_DNS/healthz"
+          fi
 
       - name: Summary
         run: |
