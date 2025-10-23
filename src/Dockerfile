@@ -20,8 +20,8 @@
 
     COPY --from=builder /podinfo /home/app/podinfo
 
-    EXPOSE 8080
+    EXPOSE 9898
     HEALTHCHECK --interval=15s --timeout=3s CMD wget -qO- http://localhost:9898/healthz || exit 1
 
     ENTRYPOINT ["/home/app/podinfo"]
-    CMD ["--port=8080"]
+    CMD ["--port=9898"]

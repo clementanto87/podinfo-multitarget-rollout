@@ -79,7 +79,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "9898"
 	}
 
 	log.Printf("Starting podinfo on :%s", port)
