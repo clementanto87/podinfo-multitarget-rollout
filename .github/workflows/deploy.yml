@@ -162,9 +162,9 @@ jobs:
       - name: Fetch endpoints
         run: |
           LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
-          ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
+        
           echo "LAMBDA_URL=$LAMBDA_URL" >> $GITHUB_ENV
-          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          
 
       - name: Run final smoke tests
         env:
