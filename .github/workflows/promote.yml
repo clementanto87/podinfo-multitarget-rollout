@@ -1,11 +1,10 @@
-# .github/workflows/promote.yml
-name: Promote Podinfo Image to Production
+name: Promote Podinfo to Production
 
 on:
   workflow_dispatch:
     inputs:
       image_digest:
-        description: "Immutable image digest to promote (sha256:...)"
+        description: 'Image digest to promote to production (sha256:...)'
         required: true
 
 permissions:
@@ -15,36 +14,22 @@ permissions:
 env:
   AWS_REGION: eu-west-1
   IMAGE_NAME: podinfo
-  DEPLOY_ENV: prod # This is used as deploy_env in the promote job
-  AWS_ACCOUNT_ID: "910246205478"
+  DEPLOY_ENV: prod
+  AWS_ACCOUNT_ID: "910246205478" # Replace with your AWS Account ID
 
 jobs:
-  approval:
-    name: Manual Approval Gate
+  promote-to-prod:
+    name: Promote to Production
     runs-on: ubuntu-latest
-    environment:
-      name: production
-      url: https://console.aws.amazon.com/
-    steps:
-      - name: Confirm Promotion
-        run: echo "Awaiting manual approval before promoting to production for image ${{ github.event.inputs.image_digest }}"
-
-  promote:
-    name: Deploy to Production (Dual-Target)
-    runs-on: ubuntu-latest
-    needs: approval
     timeout-minutes: 60
+
+    # This environment must be configured in the repository settings
+    # to require manual approval.
+    environment: production
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Install yq, jq, and zip
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq zip
-          # Ensure yq is installed exactly as in the dev workflow
-          curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
-          chmod +x /usr/local/bin/yq
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -60,24 +45,14 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
-          COSIGN_EXPERIMENTAL: "1" # Add experimental flag as in deploy.yaml
+          COSIGN_EXPERIMENTAL: "1"
         run: |
           set -euo pipefail
           echo "Verifying image signature for $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
-
-          # --- Install latest stable Cosign (Copied from deploy.yaml) ---
-          COSIGN_VERSION=$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest | jq -r .tag_name)
-          if [ -z "$COSIGN_VERSION" ] || [ "$COSIGN_VERSION" = "null" ]; then
-            COSIGN_VERSION="v2.2.4" # fallback safe default
-          fi
-          echo "Installing Cosign $COSIGN_VERSION"
-          curl -fsSL -o /usr/local/bin/cosign \
-            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          # Install Cosign
+          curl -fsSL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/v2.2.4/cosign-linux-amd64"
           chmod +x /usr/local/bin/cosign
-          cosign version
-          
-          # --- Verify image signature (keyless OIDC mode) ---
-          # Use the exact command from deploy.yaml
+          # Verify
           cosign verify \
             "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
@@ -88,270 +63,132 @@ jobs:
         with:
           terraform_version: 1.5.6
 
-      # -------------------------------------------------
-      # LAMBDA: Provision infra (re-apply) + trigger CodeDeploy
-      # -------------------------------------------------
-      - name: Deploy Lambda infra (Terraform)
-        working-directory: infra/lambda
-        env:
-          TF_VAR_region: ${{ env.AWS_REGION }}
-          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
-          TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
-          TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+      # --- Parallel Terraform Apply ---
+      - name: Deploy Lambda and EC2 Stacks in Parallel
         run: |
           set -euo pipefail
-          terraform init -input=false \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=infra/lambda/${{ env.DEPLOY_ENV }}.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=terraform-state-locks"
-          # Apply to update any variables that depend on image_digest or ensure infra is present/correct
-          terraform apply -auto-approve \
-            -var="region=${{ env.AWS_REGION }}" \
-            -var="deploy_env=${{ env.DEPLOY_ENV }}" \
-            -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
-            -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
-            -var="image_digest=${{ github.event.inputs.image_digest }}"
+          # Run Lambda apply in the background
+          (
+            cd infra/lambda
+            echo "INFO: Initializing Terraform for Lambda..."
+            terraform init -input=false \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="key=infra/lambda/${{ env.DEPLOY_ENV }}.tfstate" \
+              -backend-config="region=${{ env.AWS_REGION }}" \
+              -backend-config="dynamodb_table=terraform-state-locks"
+            echo "INFO: Applying Terraform for Lambda..."
+            terraform apply -auto-approve \
+              -var="region=${{ env.AWS_REGION }}" \
+              -var="deploy_env=${{ env.DEPLOY_ENV }}" \
+              -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
+              -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
+              -var="image_digest=${{ github.event.inputs.image_digest }}"
+            echo "INFO: Terraform apply for Lambda finished."
+          ) &
+          LAMBDA_PID=$!
+          # Run EC2 apply in the background
+          (
+            cd infra/ec2
+            echo "INFO: Initializing Terraform for EC2..."
+            terraform init -input=false \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="key=infra/ec2/${{ env.DEPLOY_ENV }}.tfstate" \
+              -backend-config="region=${{ env.AWS_REGION }}" \
+              -backend-config="dynamodb_table=terraform-state-locks"
+            echo "INFO: Applying Terraform for EC2..."
+            terraform apply -auto-approve \
+              -var="region=${{ env.AWS_REGION }}" \
+              -var="deploy_env=${{ env.DEPLOY_ENV }}" \
+              -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
+              -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
+              -var="image_digest=${{ github.event.inputs.image_digest }}"
+            echo "INFO: Terraform apply for EC2 finished."
+          ) &
+          EC2_PID=$!
+          # Wait for both background jobs to complete
+          wait $LAMBDA_PID
+          wait $EC2_PID
 
-      - name: Prepare Lambda for CodeDeploy (Get Versions)
-        id: prepare_lambda
+      # --- Create and Trigger CodeDeploy Deployments ---
+      - name: Create and Trigger CodeDeploy for Lambda and EC2
         run: |
           set -euo pipefail
-          FUNCTION_NAME="podinfo-${{ env.DEPLOY_ENV }}"
-          ALIAS_NAME="live"
+          # Lambda Deployment
+          (
+            cd infra/lambda
+            cat > appspec.yaml <<EOF
+            version: 0.0
+            Resources:
+              - TargetService:
+                  Type: AWS::Lambda::Function
+                  Properties:
+                    Name: "podinfo-${{ env.DEPLOY_ENV }}"
+                    Alias: "live"
+                    CurrentVersion: "1" # These versions are placeholders
+                    TargetVersion: "2" # CodeDeploy will determine the actual versions
+            EOF
+            APPSPEC_CONTENT=$(yq -o=json -I=0 < appspec.yaml | tr -d '\n')
+            APPSPEC_SHA256=$(echo -n "$APPSPEC_CONTENT" | sha256sum | cut -d' ' -f1)
+            jq -n --arg content "$APPSPEC_CONTENT" --arg sha "$APPSPEC_SHA256" \
+              '{revisionType: "AppSpecContent", appSpecContent: {content: $content, sha256: $sha}}' > appspec-content.json
+            LAMBDA_DEPLOY_ID=$(aws deploy create-deployment \
+              --application-name "podinfo-lambda-${{ env.DEPLOY_ENV }}" \
+              --deployment-group-name "lambda-group-${{ env.DEPLOY_ENV }}" \
+              --revision file://appspec-content.json \
+              --description "Deploy ${{ github.event.inputs.image_digest }}" \
+              --query deploymentId --output text)
+            echo "LAMBDA_CODEDEPLOY_ID=$LAMBDA_DEPLOY_ID" >> $GITHUB_ENV
+          ) &
+          # EC2 Deployment
+          (
+            mkdir -p deployment/scripts
+            cp -r scripts/*.sh scripts/appspec.yml deployment/scripts/
+            echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}@${{ github.event.inputs.image_digest }}" > deployment/scripts/.env
+            cd deployment && zip -r ../deployment.zip .
+            aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip
+            EC2_DEPLOY_ID=$(aws deploy create-deployment \
+              --application-name "podinfo-ec2-${{ env.DEPLOY_ENV }}" \
+              --deployment-group-name "ec2-group-${{ env.DEPLOY_ENV }}" \
+              --s3-location bucket=${{ secrets.TF_STATE_BUCKET }},key=deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip,bundleType=zip \
+              --description "Deploy ${{ github.event.inputs.image_digest }}" \
+              --query deploymentId --output text)
+            echo "EC2_CODEDEPLOY_ID=$EC2_DEPLOY_ID" >> $GITHUB_ENV
+          ) &
+          wait
 
-          # 1. Get the current version pointed to by the alias.
-          # If the alias doesn't exist, CURRENT_VERSION will be empty.
-          echo "Checking for existing alias '$ALIAS_NAME' on function '$FUNCTION_NAME'..."
-          CURRENT_VERSION=$(aws lambda get-alias \
-            --function-name "$FUNCTION_NAME" \
-            --name "$ALIAS_NAME" \
-            --query FunctionVersion \
-            --output text 2>/dev/null || echo "")
-
-          if [ -n "$CURRENT_VERSION" ]; then
-            echo "Found existing alias pointing to version: $CURRENT_VERSION"
-          else
-            echo "Alias '$ALIAS_NAME' does not exist. This will be treated as a first-time deployment."
-          fi
-
-          # 2. Publish a new version from $LATEST.
-          # Terraform has already updated $LATEST with the new image digest.
-          echo "Publishing new version for function '$FUNCTION_NAME'..."
-          # Use `|| true` to capture error output without exiting immediately
-          PUBLISH_OUTPUT=$(aws lambda publish-version \
-            --function-name "$FUNCTION_NAME" \
-            --description "Promote ${{ github.event.inputs.image_digest }}" \
-            --output json 2>&1) || true
-
-          # Check for ResourceConflictException, which means no code has changed.
-          if echo "$PUBLISH_OUTPUT" | grep -q "ResourceConflictException"; then
-            echo "No changes detected in the function's code or configuration."
-            echo "Skipping Lambda deployment as there is nothing new to deploy."
-            echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
-            exit 0 # Exit successfully
-          # Check for other errors by validating if the output is valid JSON with a .Version key
-          elif ! echo "$PUBLISH_OUTPUT" | jq -e .Version > /dev/null; then
-            echo "::error::Failed to publish new Lambda version. Output:"
-            echo "$PUBLISH_OUTPUT"
-            exit 1
-          fi
-
-          NEW_VERSION=$(echo "$PUBLISH_OUTPUT" | jq -r .Version)
-          echo "Successfully published new version: $NEW_VERSION"
-
-          # 3. Handle first-time deployment (alias did not exist)
-          if [ -z "$CURRENT_VERSION" ]; then
-            echo "Creating new alias '$ALIAS_NAME' to point directly to version '$NEW_VERSION'."
-            aws lambda create-alias \
-              --function-name "$FUNCTION_NAME" \
-              --name "$ALIAS_NAME" \
-              --function-version "$NEW_VERSION" \
-              --description "Production alias for podinfo Lambda"
-            echo "Alias created. Skipping CodeDeploy for this initial deployment."
-            echo "SKIP_LAMBDA_CODEDEPLOY=true" >> $GITHUB_ENV
-            exit 0 # Exit successfully
-          fi
-
-          # 4. If we are here, it's a standard deployment. Validate versions before proceeding.
-          if ! [[ "$CURRENT_VERSION" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::Invalid CURRENT_VERSION: '$CURRENT_VERSION'. Must be a positive integer."
-            exit 1
-          fi
-          if ! [[ "$NEW_VERSION" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::Invalid NEW_VERSION: '$NEW_VERSION'. Must be a positive integer."
-            exit 1
-          fi
-
-          echo "Proceeding with CodeDeploy."
-          echo "Current Version (for rollback): $CURRENT_VERSION"
-          echo "Target Version (new release): $NEW_VERSION"
-
-          # Export variables for the next step
-          echo "CURRENT_VERSION=$CURRENT_VERSION" >> $GITHUB_ENV
-          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
-          echo "FUNCTION_NAME=$FUNCTION_NAME" >> $GITHUB_ENV
-          echo "ALIAS_NAME=$ALIAS_NAME" >> $GITHUB_ENV
-
-      - name: Create Lambda CodeDeploy Deployment (prod)
-        if: env.SKIP_LAMBDA_CODEDEPLOY != 'true'
-        env:
-          ECR_REPO_URL: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+      # --- Wait for Deployments to Complete ---
+      - name: Wait for CodeDeploy Rollouts in Parallel
         run: |
           set -euo pipefail
+          echo "Waiting for Lambda deployment: $LAMBDA_CODEDEPLOY_ID"
+          aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID" &
+          LAMBDA_WAIT_PID=$!
+          echo "Waiting for EC2 deployment: $EC2_CODEDEPLOY_ID"
+          aws deploy wait deployment-successful --deployment-id "$EC2_CODEDEPLOY_ID" &
+          EC2_WAIT_PID=$!
+          wait $LAMBDA_WAIT_PID
+          wait $EC2_WAIT_PID
+          echo "Both deployments completed successfully."
 
-          # Build the AppSpec JSON with proper integer types, as required by the CodeDeploy API.
-          jq -n \
-            --arg fname "$FUNCTION_NAME" \
-            --arg alias "$ALIAS_NAME" \
-            --argjson current "$CURRENT_VERSION" \
-            --argjson target "$NEW_VERSION" \
-            '{
-              version: "0.0",
-              Resources: [{
-                TargetService: {
-                  Type: "AWS::Lambda::Function",
-                  Properties: {
-                    Name: $fname,
-                    Alias: $alias,
-                    CurrentVersion: $current,
-                    TargetVersion: $target
-                  }
-                }
-              }]
-            }' | tr -d '\n' > appspec-content.json
-
-          # Read the content
-          APPSPEC_CONTENT=$(cat appspec-content.json)
-
-          # Calculate SHA256
-          APPSPEC_SHA256=$(echo -n "$APPSPEC_CONTENT" | sha256sum | cut -d' ' -f1)
-
-          echo "AppSpec Content: $APPSPEC_CONTENT"
-          echo "AppSpec SHA256: $APPSPEC_SHA256"
-
-          # Build the revision JSON
-          jq -n \
-            --arg content "$APPSPEC_CONTENT" \
-            --arg sha "$APPSPEC_SHA256" \
-            '{
-              revisionType: "AppSpecContent",
-              appSpecContent: {
-                content: $content,
-                sha256: $sha
-              }
-            }' > revision.json
-
-          # Create the deployment
-          DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name "podinfo-lambda-${{ env.DEPLOY_ENV }}" \
-            --deployment-group-name "lambda-group-${{ env.DEPLOY_ENV }}" \
-            --revision file://revision.json \
-            --description "Deploy $ECR_REPO_URL@${{ github.event.inputs.image_digest }}" \
-            --query deploymentId --output text)
-          echo "LAMBDA_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
-
-      - name: Wait for Lambda CodeDeploy (prod)
-        if: env.LAMBDA_CODEDEPLOY_ID != '' && env.SKIP_LAMBDA_CODEDEPLOY != 'true'
-        # Added pipefail and changed to run always with status check later
+      # --- Final Smoke Tests ---
+      - name: Fetch Endpoints
+        id: fetch-endpoints
         run: |
-          set +e # Don't exit on failure here so we can get deployment details
-          aws deploy wait deployment-successful --deployment-id "$LAMBDA_CODEDEPLOY_ID" || DEPLOYMENT_STATUS=$?
-          set -e
-          echo "DEPLOYMENT_STATUS=$DEPLOYMENT_STATUS" >> $GITHUB_ENV
+          LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url)
+          ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns)
+          echo "lambda_url=$LAMBDA_URL" >> $GITHUB_OUTPUT
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
 
-      - name: Get CodeDeploy Deployment Status and Failure Details
-        if: env.LAMBDA_CODEDEPLOY_ID != '' && env.DEPLOYMENT_STATUS != '0' && env.SKIP_LAMBDA_CODEDEPLOY != 'true'
-        run: |
-          echo "--- AWS CodeDeploy Failure Details for $LAMBDA_CODEDEPLOY_ID ---"
-          aws deploy get-deployment --deployment-id "$LAMBDA_CODEDEPLOY_ID" --output json
-          echo "---------------------------------------------------------"
-          exit 1 # Fail the step if the waiter failed
-
-      # -------------------------------------------------
-      # EC2: Re-apply infra + deploy new bundle
-      # -------------------------------------------------
-      - name: Deploy EC2 infra (Terraform)
-        working-directory: infra/ec2
-        env:
-          TF_VAR_region: ${{ env.AWS_REGION }}
-          TF_VAR_deploy_env: ${{ env.DEPLOY_ENV }} # Use env.DEPLOY_ENV (prod)
-          TF_VAR_super_secret_token_arn: arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token
-          TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
+      - name: Run Final Smoke Tests
         run: |
           set -euo pipefail
-          terraform init -input=false \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=infra/ec2/${{ env.DEPLOY_ENV }}.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=terraform-state-locks"
-          terraform apply -auto-approve \
-            -var="region=${{ env.AWS_REGION }}" \
-            -var="deploy_env=${{ env.DEPLOY_ENV }}" \
-            -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
-            -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
-            -var="image_digest=${{ github.event.inputs.image_digest }}"
+          echo "Running smoke tests..."
+          ./scripts/smoke_tests.sh ${{ steps.fetch-endpoints.outputs.lambda_url }} ${{ steps.fetch-endpoints.outputs.alb_dns }}
 
-      - name: Create EC2 deployment bundle (prod)
+      - name: Summary
         run: |
-          mkdir -p deployment/scripts
-          cp -r scripts/*.sh scripts/appspec.yml deployment/scripts/
-          # Inject image digest into environment (optional)
-          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}@${{ github.event.inputs.image_digest }}" > deployment/scripts/.env
-          echo "SUPER_SECRET_TOKEN_ARN=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" >> deployment/scripts/.env
-          echo "AWS_REGION=${{ env.AWS_REGION }}" >> deployment/scripts/.env
-          cd deployment
-          zip -r ../deployment.zip .
-
-      - name: Upload bundle to S3
-        # Match the naming convention from deploy.yaml
-        run: |
-          aws s3 cp deployment.zip s3://${{ secrets.TF_STATE_BUCKET }}/deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip
-
-      - name: Create EC2 CodeDeploy Deployment (prod)
-        run: |
-          DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name "podinfo-ec2-${{ env.DEPLOY_ENV }}" \
-            --deployment-group-name "ec2-group-${{ env.DEPLOY_ENV }}" \
-            --s3-location bucket=${{ secrets.TF_STATE_BUCKET }},key=deployments/podinfo-${{ env.DEPLOY_ENV }}-${{ github.run_id }}.zip,bundleType=zip \
-            --description "Promote ${{ github.event.inputs.image_digest }}" \
-            --query deploymentId --output text)
-          echo "EC2_CODEDEPLOY_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
-
-      - name: Wait for EC2 CodeDeploy (prod)
-        if: env.EC2_CODEDEPLOY_ID != ''
-        run: |
-          aws deploy wait deployment-successful --deployment-id "$EC2_CODEDEPLOY_ID"
-
-      # -------------------------------------------------
-      # Final validation
-      # -------------------------------------------------
-      - name: Fetch prod endpoints
-        run: |
-          # Use env.DEPLOY_ENV (prod) in the path
-          LAMBDA_URL=$(cd infra/lambda && terraform output -raw lambda_api_url 2>/dev/null || echo "")
-          ALB_DNS=$(cd infra/ec2 && terraform output -raw alb_dns 2>/dev/null || echo "")
-          echo "LAMBDA_URL=$LAMBDA_URL" >> $GITHUB_ENV
-          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
-
-      - name: Run smoke tests (prod)
-        env:
-          LAMBDA_URL: ${{ env.LAMBDA_URL }}
-          ALB_DNS: ${{ env.ALB_DNS }}
-        run: |
-          set -euo pipefail
-          if [ -n "$LAMBDA_URL" ]; then
-            curl -sfS "$LAMBDA_URL/healthz"
-          fi
-          if [ -n "$ALB_DNS" ]; then
-            curl -sfS "http://$ALB_DNS/healthz"
-          fi
-
-      - name: Promotion Summary
-        run: |
-          echo "### Production Promotion Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Image digest: \`${{ github.event.inputs.image_digest }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Environment: ${{ env.DEPLOY_ENV }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Promoted by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Lambda URL: ${{ env.LAMBDA_URL }}" >> $GITHUB_STEP_SUMMARY
-          echo "- ALB DNS: ${{ env.ALB_DNS }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Promotion to Production Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** `${{ env.IMAGE_NAME }}@${{ github.event.inputs.image_digest }}`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lambda URL:** `${{ steps.fetch-endpoints.outputs.lambda_url }}`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ALB DNS:** `${{ steps.fetch-endpoints.outputs.alb_dns }}`" >> $GITHUB_STEP_SUMMARY
