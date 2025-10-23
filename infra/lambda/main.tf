@@ -202,12 +202,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_error" {
   }
 }
 
-resource "aws_lambda_alias" "live" {
-  name             = "live"
-  description      = "Live traffic alias"
-  function_name    = aws_lambda_function.podinfo.function_name
-  function_version = "$LATEST"
-}
+
 
 ####################
 # Outputs
