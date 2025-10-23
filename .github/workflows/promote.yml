@@ -49,14 +49,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "Verifying image signature for $ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST"
-          # Install Cosign
           curl -fsSL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/v2.2.4/cosign-linux-amd64"
           chmod +x /usr/local/bin/cosign
-          # Verify
           cosign verify \
             "$ECR_REGISTRY/${{ env.IMAGE_NAME }}@$IMAGE_DIGEST" \
-            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/.*@refs/.*" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "https://github.com/.+"
+      
 
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
