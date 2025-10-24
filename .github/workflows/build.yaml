@@ -2,7 +2,7 @@ name: Build, Sign & Publish Podinfo
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "modules"]
   pull_request:
 
 permissions:
