@@ -91,25 +91,17 @@ jobs:
           TF_VAR_ecr_repo_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-
           terraform init -input=false \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=infra/lambda/${{ github.event.inputs.deploy_env }}.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=terraform-state-locks"
-
-          # --- Import existing resources if they exist ---
-          terraform import -allow-missing aws_codedeploy_app.lambda "podinfo-lambda-${{ github.event.inputs.deploy_env }}" || true
-          terraform import -allow-missing aws_iam_role.codedeploy_lambda "codedeploy-lambda-role-${{ github.event.inputs.deploy_env }}" || true
-          terraform import -allow-missing aws_iam_role.lambda_exec "podinfo-lambda-exec-${{ github.event.inputs.deploy_env }}" || true
-
           terraform apply -auto-approve \
             -var="region=${{ env.AWS_REGION }}" \
             -var="deploy_env=${{ github.event.inputs.deploy_env }}" \
             -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
             -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
             -var="image_digest=${{ github.event.inputs.image_digest }}"
-      
 
       - name: Generate AppSpec for Lambda CodeDeploy
         working-directory: infra/lambda
