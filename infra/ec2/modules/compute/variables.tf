@@ -1,21 +1,11 @@
-variable "region" {
-  description = "AWS region"
+variable "name_prefix" {
+  description = "Prefix for resource names"
   type        = string
 }
 
 variable "deploy_env" {
-  description = "Deployment environment (e.g., dev, staging, prod)"
+  description = "Deployment environment"
   type        = string
-}
-
-variable "vpc_cidr" {
-  description = "CIDR block for VPC"
-  type        = string
-}
-
-variable "public_subnet_cidrs" {
-  description = "List of public subnet CIDR blocks"
-  type        = list(string)
 }
 
 variable "instance_type" {
@@ -24,23 +14,38 @@ variable "instance_type" {
 }
 
 variable "desired_capacity" {
-  description = "Desired number of instances in ASG"
+  description = "Desired number of instances"
   type        = number
 }
 
 variable "min_size" {
-  description = "Minimum number of instances in ASG"
+  description = "Minimum number of instances"
   type        = number
 }
 
 variable "max_size" {
-  description = "Maximum number of instances in ASG"
+  description = "Maximum number of instances"
   type        = number
 }
 
 variable "enable_scaling" {
   description = "Enable auto scaling"
   type        = bool
+}
+
+variable "public_subnets" {
+  description = "List of public subnet IDs"
+  type        = list(string)
+}
+
+variable "instance_sg_id" {
+  description = "Instance security group ID"
+  type        = string
+}
+
+variable "instance_profile" {
+  description = "IAM instance profile name"
+  type        = string
 }
 
 variable "ecr_repo_url" {
@@ -55,5 +60,10 @@ variable "image_digest" {
 
 variable "super_secret_token_arn" {
   description = "ARN of the secret in Secrets Manager"
+  type        = string
+}
+
+variable "region" {
+  description = "AWS region"
   type        = string
 }
