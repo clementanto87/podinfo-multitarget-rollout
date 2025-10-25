@@ -23,7 +23,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
   "metrics": {
     "namespace": "Podinfo/EC2",
     "append_dimensions": {
-      "AutoScalingGroupName": "$(/opt/aws/bin/ec2-metadata -t | cut -d' ' -f2)"
+      "AutoScalingGroupName": "$$(/opt/aws/bin/ec2-metadata -t | cut -d' ' -f2)"
     },
     "metrics_collected": {
       "mem": { "measurement": ["mem_used_percent"] },
