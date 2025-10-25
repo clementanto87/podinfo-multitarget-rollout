@@ -34,7 +34,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
 EOF
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
-# Pull and run podinfo
+# Pull and run podinfo (variables here are fine as they are outside the JSON block)
 docker run -d \
   --name podinfo \
   -p 9898:9898 \
