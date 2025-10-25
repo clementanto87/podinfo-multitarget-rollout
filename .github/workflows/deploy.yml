@@ -101,7 +101,12 @@ jobs:
             -var="deploy_env=${{ github.event.inputs.deploy_env }}" \
             -var="super_secret_token_arn=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:podinfo/super-secret-token" \
             -var="ecr_repo_url=${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}" \
-            -var="image_digest=${{ github.event.inputs.image_digest }}"
+            -var="image_digest=${{ github.event.inputs.image_digest }}" \
+            -var="instance_type=t3.micro" \
+            -var="desired_capacity=2" \
+            -var="min_size=1" \
+            -var="max_size=3" \
+            -var="enable_scaling=true"
 
       - name: Generate AppSpec for Lambda CodeDeploy
         working-directory: infra/lambda
