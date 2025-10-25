@@ -18,7 +18,7 @@ ASG_NAME=$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTA
 
 # Install CloudWatch Agent
 yum install -y amazon-cloudwatch-agent
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
 {
   "agent": {
     "metrics_collection_interval": 60,
@@ -27,7 +27,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
   "metrics": {
     "namespace": "Podinfo/EC2",
     "append_dimensions": {
-      "AutoScalingGroupName": "$${ASG_NAME}"
+      "AutoScalingGroupName": "\$ASG_NAME"
     },
     "metrics_collected": {
       "mem": {
@@ -43,7 +43,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
 EOF
 
 # Replace placeholder with actual ASG name
-sed -i "s/\$\${ASG_NAME}/$ASG_NAME/g" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+sed -i "s/\$ASG_NAME/$ASG_NAME/g" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
 # Start CloudWatch Agent
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
