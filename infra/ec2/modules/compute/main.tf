@@ -28,11 +28,6 @@ resource "aws_launch_template" "lt" {
     security_groups             = [var.instance_sg_id]
   }
 
-  user_data = base64encode(templatefile("${path.module}/userdata.sh.tpl", {
-    image_uri  = "${var.ecr_repo_url}@${var.image_digest}"
-    secret_arn = var.super_secret_token_arn
-    region     = var.region
-  }))
 
   tag_specifications {
     resource_type = "instance"
