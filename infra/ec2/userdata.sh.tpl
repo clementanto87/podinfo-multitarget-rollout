@@ -12,9 +12,13 @@ systemctl start docker
 systemctl enable docker
 usermod -a -G docker ec2-user
 
+# Get instance metadata
+INSTANCE_ID=$(ec2-metadata --instance-id | cut -d' ' -f2)
+ASG_NAME=$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTANCE_ID --region $REGION --query 'AutoScalingInstances[0].AutoScalingGroupName' --output text)
+
 # Install CloudWatch Agent
 yum install -y amazon-cloudwatch-agent
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
 {
   "agent": {
     "metrics_collection_interval": 60,
@@ -23,18 +27,28 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
   "metrics": {
     "namespace": "Podinfo/EC2",
     "append_dimensions": {
-      "AutoScalingGroupName": "`/opt/aws/bin/ec2-metadata -t | cut -d' ' -f2`"
+      "AutoScalingGroupName": "$${ASG_NAME}"
     },
     "metrics_collected": {
-      "mem": { "measurement": ["mem_used_percent"] },
-      "cpu": { "resources": ["*"], "measurement": ["cpu_usage_idle"] }
+      "mem": {
+        "measurement": ["mem_used_percent"]
+      },
+      "cpu": {
+        "resources": ["*"],
+        "measurement": ["cpu_usage_idle"]
+      }
     }
   }
 }
 EOF
+
+# Replace placeholder with actual ASG name
+sed -i "s/\$\${ASG_NAME}/$ASG_NAME/g" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+# Start CloudWatch Agent
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
-# Pull and run podinfo (variables here are fine as they are outside the JSON block)
+# Pull and run podinfo
 docker run -d \
   --name podinfo \
   -p 9898:9898 \
