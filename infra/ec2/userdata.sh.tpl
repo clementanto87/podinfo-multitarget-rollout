@@ -22,7 +22,7 @@ sudo ./install auto
 echo "Configuring application environment file..."
 ENV_FILE="/etc/profile.d/app-env.sh"
 sudo mkdir -p /etc/profile.d/
-# NOTE THE QUOTES: <<'EOF' to prevent shell variable expansion by Terraform
+# CRITICAL FIX 1: Use <<'EOF' to prevent shell variable expansion by Terraform
 cat <<'EOF' | sudo tee $ENV_FILE
 # Template variables are substituted here
 export AWS_REGION="${REGION}"
@@ -41,7 +41,7 @@ ASG_NAME=$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTA
 sudo yum install -y amazon-cloudwatch-agent
 
 # CloudWatch Config File Creation
-# NOTE THE QUOTES: <<'EOF' to prevent shell variable expansion by Terraform on $ASG_NAME
+# CRITICAL FIX 2: Use <<'EOF' to prevent shell variable expansion by Terraform
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
 {
   "agent": {
